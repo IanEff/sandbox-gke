@@ -31,6 +31,14 @@ provisioning/opentofu/crash.*.log
 provisioning/opentofu/*.tfplan
 
 # ============================================================
+# SSH / Deploy Keys
+# ============================================================
+
+# ArgoCD repo deploy key — keep this in your password manager when you grow up
+.ssh/argocd-repo-key
+.ssh/argocd-repo-key.pub
+
+# ============================================================
 # macOS
 # ============================================================
 .DS_Store
