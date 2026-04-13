@@ -1,0 +1,36 @@
+# ============================================================
+# OpenTofu / Terraform
+# ============================================================
+
+# Your actual variable values — contains project_id, repo URL, etc.
+# See provisioning/opentofu/variables.tf for declarations.
+provisioning/opentofu/terraform.tfvars
+provisioning/opentofu/*.tfvars
+provisioning/opentofu/*.tfvars.json
+
+# Downloaded providers and modules — reproduced by `tofu init`
+provisioning/opentofu/.terraform/
+
+# Lock file — commit this if you want reproducible provider versions across machines,
+# leave it ignored if you don't. Uncomment the line below to commit it.
+# !provisioning/opentofu/.terraform.lock.hcl
+provisioning/opentofu/.terraform.lock.hcl
+
+# Local state files — should never exist since we use a GCS backend,
+# but belt-and-suspenders in case someone accidentally runs `tofu init` without the backend.
+provisioning/opentofu/terraform.tfstate
+provisioning/opentofu/terraform.tfstate.backup
+provisioning/opentofu/**/*.tfstate
+provisioning/opentofu/**/*.tfstate.backup
+
+# Crash logs
+provisioning/opentofu/crash.log
+provisioning/opentofu/crash.*.log
+
+# Plan files can contain sensitive values in plaintext
+provisioning/opentofu/*.tfplan
+
+# ============================================================
+# macOS
+# ============================================================
+.DS_Store
