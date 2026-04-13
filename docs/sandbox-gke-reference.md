@@ -5,74 +5,322 @@
 
 ---
 
+## Table of Contents
+
+1. [What We're Building](#what-were-building)
+2. [Directory Structure](#directory-structure)
+3. [Implementation Steps](#implementation-steps)
+4. [Reference: Layer by Layer](#reference-layer-by-layer)
+   - [Layer 0: Manual Bootstrap](#layer-0-manual-bootstrap-the-irreducible-exception)
+   - [Layer 1: GCP Project Configuration](#layer-1-gcp-project-configuration)
+   - [Layer 2: Networking](#layer-2-networking-modulesvpc)
+   - [Layer 3: GKE Cluster + Node Pool](#layer-3-gke-cluster--node-pool-modulesgke)
+   - [Layer 4: Workload Identity](#layer-4-workload-identity-modulesgke)
+   - [Layer 5: ArgoCD Bootstrap](#layer-5-argocd-bootstrap-modulesbootstrap)
+5. [Backend Configuration](#backend-configuration)
+6. [Variables and Outputs](#variables-and-outputs)
+7. [IAM Audit](#iam-audit)
+8. [Cost and Spend Management](#cost-and-spend-management)
+9. [OpenTofu Core Concepts](#opentofu-core-concepts)
+10. [Learning Objectives](#learning-objectives)
+11. [Provider and Registry References](#provider-and-registry-references)
+12. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
+
+---
+
 ## What We're Building
 
-A **repeatable, push-button GKE cluster** on GCP, managed end-to-end by OpenTofu
-wherever possible. The cluster bootstraps itself into a GitOps-ready state — ArgoCD
-installed via Helm, pointed at the existing `sandbox-gitops` repo — without any
-manual `kubectl` intervention after `tofu apply`.
+A **repeatable, push-button GKE cluster** on GCP, managed end-to-end by OpenTofu wherever
+possible. The cluster bootstraps itself into a GitOps-ready state — ArgoCD installed via
+Helm, pointed at this repo's `gitops/` directory — without any manual `kubectl` intervention
+after `tofu apply`.
 
-**GCP project:** recycled `terraform-sandbox` (IAM audit required — see below).
-**Region:** `us-east1` (GCP syntax; no hyphen before the digit, unlike AWS `us-east-1`).
-**Repo location:** `provisioning/opentofu/` subdirectory of `sandbox-gitops`.
-
----
-
-## OpenTofu Core Concepts (with doc references)
-
-Before writing a line of HCL, ground yourself in the following pages of the
-official OpenTofu docs. These are the specific concepts this project exercises.
-
-### The Core Workflow
-https://opentofu.org/docs/intro/core-workflow/
-
-Write -> Plan -> Apply. Every `tofu` operation you run in this project follows this
-loop. The docs describe a solo workflow (which is what we're doing) and a team
-workflow (which adds CI and remote state locking -- both of which we configure here,
-even for solo use, as good discipline).
-
-### The Language Reference
-https://opentofu.org/docs/language/
-
-The primary reference for HCL syntax. Every construct used below (`resource`,
-`variable`, `output`, `locals`, `module`, `data`, `provider`, `terraform`) is
-documented here. Keep this open in a tab.
-
-### CLI Reference
-https://opentofu.org/docs/cli/commands/
-
-The commands you'll use constantly:
-
-| Command | Purpose |
+| Property | Value |
 |---|---|
-| `tofu init` | Initialise working directory, install providers and modules |
-| `tofu validate` | Syntax-check your config without hitting any APIs |
-| `tofu plan` | Generate and preview an execution plan |
-| `tofu apply` | Execute the plan |
-| `tofu destroy` | Tear everything down |
-| `tofu fmt` | Auto-format HCL to canonical style |
-| `tofu output` | Print output values from the root module |
-| `tofu state` | Inspect and manipulate state (advanced) |
-
-`tofu plan` docs: https://opentofu.org/docs/cli/commands/plan/
+| GCP project | `terraform-sandbox` (recycled — IAM audit required) |
+| Region | `us-east1` |
+| Zone | `us-east1-b` (zonal cluster — cheaper than regional) |
+| State bucket | `gs://sandbox-gke-tofu-state` |
+| HCL location | `provisioning/opentofu/` (in this repo — not yet created) |
+| GitOps config | `gitops/` (in this repo — already exists) |
 
 ---
 
-## What OpenTofu Will Manage
+## Directory Structure
 
-This project pushes as much as possible into OpenTofu. Here is the full inventory,
-ordered by provisioning sequence.
+This is the full file tree you are building. Everything under `provisioning/opentofu/` is new.
+The `gitops/` directory already exists and is what ArgoCD will sync after the cluster is up.
+
+```
+sandbox-gke/
+├── provisioning/
+│   └── opentofu/                  ← run all tofu commands from here
+│       ├── backend.tf             # GCS remote state backend + required_providers
+│       ├── providers.tf           # ALL provider blocks live here (root module only)
+│       ├── variables.tf           # root module input variables
+│       ├── outputs.tf             # root module outputs
+│       ├── main.tf                # API enablement + the three module calls
+│       ├── terraform.tfvars       # your values — gitignore this file
+│       └── modules/
+│           ├── vpc/
+│           │   ├── main.tf        # google_compute_network + google_compute_subnetwork
+│           │   ├── variables.tf
+│           │   └── outputs.tf     # exports: network_id, subnetwork_id
+│           ├── gke/
+│           │   ├── main.tf        # cluster, node pool, node SA + IAM, workload identity
+│           │   ├── variables.tf
+│           │   └── outputs.tf     # exports: endpoint, ca_certificate, node_sa_email
+│           └── bootstrap/
+│               ├── main.tf        # helm_release argocd + kubernetes_manifest root Application
+│               ├── variables.tf
+│               └── outputs.tf
+└── gitops/                        ← ArgoCD manages everything in here after apply
+    ├── bootstrap/
+    │   └── root-app.yaml          # reference copy of what OpenTofu deploys into the cluster
+    ├── cluster/                   # root app points here — three ApplicationSets
+    │   ├── kustomization.yaml
+    │   ├── infra-set.yaml         # sync-wave 0: cert-manager
+    │   ├── platform-set.yaml      # sync-wave 1: prometheus, loki, tempo, alloy
+    │   └── apps-set.yaml          # sync-wave 2: otel-demo
+    ├── infra/
+    ├── platform/
+    └── apps/
+```
+
+> **Why three modules?** VPC, GKE, and Bootstrap map to three distinct concerns that
+> provision and destroy independently. Separating them also lets OpenTofu plan and sequence
+> them in the correct order.
+
+> **Why is `providers.tf` root-only?** The `kubernetes` and `helm` providers need the GKE
+> cluster's endpoint and CA certificate — values that don't exist until after the cluster is
+> provisioned. OpenTofu requires all provider blocks to live in the root module so it can
+> manage this dependency. See [Layer 5](#layer-5-argocd-bootstrap-modulesbootstrap) for the
+> full explanation.
+
+---
+
+## Implementation Steps
+
+Work through these in order. Each step links to the detailed reference section below.
+
+---
+
+### Pre-flight
+
+- [ ] **Run the [IAM audit](#iam-audit)** before writing any HCL. Confirm your identity has
+  the minimum required roles on `terraform-sandbox`.
+- [ ] **Set billing alerts.** GCP Console → Billing → Budgets & Alerts. Set at $50 and $100.
+  The cluster costs ~$0.12/hr; a forgotten long weekend = ~$7.
+
+---
+
+### Step 0 — Manual Bootstrap (one-time)
+
+These two things cannot be managed by OpenTofu because they are prerequisites for OpenTofu
+to operate at all. Do them once, then never touch them again.
+
+- [ ] **Create the GCS state bucket** — see [Layer 0](#layer-0-manual-bootstrap-the-irreducible-exception)
+- [ ] **Configure Application Default Credentials:**
+
+```bash
+gcloud auth application-default login
+```
+
+---
+
+### Step 1 — Create the File Scaffold
+
+Create the directory tree and empty stub files before writing any HCL. OpenTofu expects the
+files to exist when you run `tofu init`.
+
+```bash
+# Run from the repo root
+mkdir -p provisioning/opentofu/modules/vpc
+mkdir -p provisioning/opentofu/modules/gke
+mkdir -p provisioning/opentofu/modules/bootstrap
+
+touch provisioning/opentofu/{backend.tf,providers.tf,variables.tf,outputs.tf,main.tf}
+touch provisioning/opentofu/modules/vpc/{main.tf,variables.tf,outputs.tf}
+touch provisioning/opentofu/modules/gke/{main.tf,variables.tf,outputs.tf}
+touch provisioning/opentofu/modules/bootstrap/{main.tf,variables.tf,outputs.tf}
+
+# terraform.tfvars will contain your GCP project ID — never commit it
+echo "provisioning/opentofu/terraform.tfvars" >> .gitignore
+```
+
+---
+
+### Step 2 — Backend and Providers
+
+Write these two files first — they are the foundation everything else depends on.
+
+- [ ] Write `backend.tf` → see [Backend Configuration](#backend-configuration)
+- [ ] Write `providers.tf` → see [The Provider Chaining Problem](#the-provider-chaining-problem)
+
+Read the Provider Chaining section carefully before writing `providers.tf`. The way the
+`kubernetes` and `helm` providers reference `module.gke.*` outputs is the most non-obvious
+part of this entire project.
+
+---
+
+### Step 3 — Variables
+
+- [ ] Write `variables.tf` → see [Variables and Outputs](#variables-and-outputs)
+- [ ] Write `terraform.tfvars` with your actual values (this file is gitignored):
+
+```hcl
+# provisioning/opentofu/terraform.tfvars  ← DO NOT COMMIT
+project_id      = "terraform-sandbox"
+gitops_repo_url = "https://github.com/<your-username>/sandbox-gke"
+```
+
+---
+
+### Step 4 — VPC Module
+
+- [ ] Write `modules/vpc/variables.tf`
+- [ ] Write `modules/vpc/main.tf` → see [Layer 2](#layer-2-networking-modulesvpc)
+- [ ] Write `modules/vpc/outputs.tf` — must export `network_id` and `subnetwork_id`
+
+---
+
+### Step 5 — GKE Module
+
+This module contains three conceptual layers (service account, cluster + node pool, workload
+identity) but they all live in one `main.tf` because they're all tightly coupled GKE
+resources.
+
+- [ ] Write `modules/gke/variables.tf`
+- [ ] Write `modules/gke/main.tf`:
+  - Node SA + IAM bindings → [Layer 1b](#1b-service-account-for-the-gke-node-pool)
+  - Cluster + node pool → [Layer 3](#layer-3-gke-cluster--node-pool-modulesgke)
+  - Workload Identity → [Layer 4](#layer-4-workload-identity-modulesgke)
+- [ ] Write `modules/gke/outputs.tf` — must export `endpoint`, `ca_certificate`, and
+  `node_sa_email`; mark the first two `sensitive = true`
+
+---
+
+### Step 6 — Bootstrap Module
+
+- [ ] Write `modules/bootstrap/variables.tf` — needs `gitops_repo_url` as an input
+- [ ] Write `modules/bootstrap/main.tf` → see [Layer 5](#layer-5-argocd-bootstrap-modulesbootstrap)
+- [ ] Write `modules/bootstrap/outputs.tf`
+
+---
+
+### Step 7 — Root Module Wiring
+
+- [ ] Write `main.tf` — the `google_project_service` resources and the three module calls →
+  see [Root Module Calls](#root-module-calls)
+- [ ] Write `outputs.tf` → see [Variables and Outputs](#variables-and-outputs)
+
+---
+
+### Step 8 — Init and Validate
+
+```bash
+cd provisioning/opentofu
+
+# Downloads providers (google, kubernetes, helm), installs modules,
+# and connects to the GCS backend to verify state access.
+# Run this again any time you add or change a provider or module.
+tofu init
+
+# Syntax-checks all HCL without touching any APIs.
+# Catches typos and structural errors cheaply.
+tofu validate
+
+# Auto-formats all HCL to canonical style. The -recursive flag covers modules too.
+tofu fmt -recursive
+```
+
+If `tofu init` fails, the most common causes are: ADC not configured, the GCS state bucket
+does not exist yet, or a typo in `backend.tf`.
+
+---
+
+### Step 9 — Plan and Apply
+
+```bash
+# Previews exactly what OpenTofu will create, change, or destroy.
+# No infrastructure is touched. Read this carefully before applying.
+tofu plan
+
+# Executes the plan. Type "yes" when prompted.
+# Takes approximately 8–10 minutes; the GKE control plane is the slow part.
+tofu apply
+```
+
+OpenTofu will sequence the work automatically based on the dependency graph:
+
+```
+APIs → VPC → GKE service account + IAM → GKE cluster → node pool → ArgoCD (Helm) → ArgoCD Application CRD
+```
+
+When `tofu apply` finishes, ArgoCD begins syncing `gitops/cluster/` automatically. The
+three ApplicationSets deploy in sync-wave order: infra → platform → apps.
+
+---
+
+### Step 10 — Verify
+
+[`gcloud container clusters get-credentials` reference](https://docs.cloud.google.com/sdk/gcloud/reference/container/clusters/get-credentials)
+
+```bash
+# Configure kubectl to talk to the new cluster
+gcloud container clusters get-credentials sandbox-gke \
+  --zone us-east1-b \
+  --project terraform-sandbox
+
+# Confirm nodes are Ready
+kubectl get nodes
+
+# Confirm ArgoCD pods are running
+kubectl get pods -n argocd
+
+# Port-forward the ArgoCD UI to http://localhost:8080
+kubectl port-forward svc/argocd-server 8080:443 -n argocd
+```
+
+The initial ArgoCD admin password is stored as a Kubernetes secret:
+
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+```
+
+---
+
+### Step 11 — Teardown
+
+```bash
+# Destroy all managed infrastructure. Takes ~5 minutes.
+# Run this whenever you are done for the day — the cluster costs money while running.
+tofu destroy
+```
+
+The GCS state bucket and its contents survive `tofu destroy`. That is intentional — the
+state records what was destroyed and the bucket costs essentially nothing to keep.
+
+---
+
+## Reference: Layer by Layer
+
+Detailed reference for each layer. Every code block is labeled with its destination file.
+
+---
 
 ### Layer 0: Manual Bootstrap (the irreducible exception)
 
-These two things cannot be managed by OpenTofu because they are prerequisites for
-OpenTofu to operate at all. They must be done once by hand.
+These two things must be done once by hand. They are prerequisites for OpenTofu to run at
+all, so OpenTofu cannot manage them.
 
-**1. The GCS state bucket**
+#### The GCS State Bucket
 
-OpenTofu cannot manage the bucket that stores its own state. This is a universal
-bootstrapping problem in IaC. The standard answer is: create it manually once,
-then leave it alone forever.
+OpenTofu cannot manage the bucket that holds its own state — the bucket must exist before
+`tofu init` can connect to the backend. Create it once and leave it alone.
+
+[`gcloud storage buckets create` reference](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/create) | [`gcloud storage buckets update` reference](https://docs.cloud.google.com/sdk/gcloud/reference/storage/buckets/update)
 
 ```bash
 # Create the state bucket
@@ -81,36 +329,42 @@ gcloud storage buckets create gs://sandbox-gke-tofu-state \
   --location=us-east1 \
   --uniform-bucket-level-access
 
-# Enable versioning -- lets you roll back corrupted state
+# Enable versioning — allows rolling back to a previous state file if something goes wrong
 gcloud storage buckets update gs://sandbox-gke-tofu-state \
   --versioning
 ```
 
-**2. Application Default Credentials (ADC)**
+GCS supports state locking natively via object metadata — no DynamoDB table required
+(that is an S3/AWS-specific requirement).
 
-OpenTofu needs credentials to authenticate with GCP before it can provision
-anything. For local use, `gcloud auth application-default login` is correct.
-The service account work below (which is managed by OpenTofu) is about what
-credentials the cluster uses at runtime, not what credentials OpenTofu uses
-to run.
+#### Application Default Credentials (ADC)
+
+OpenTofu uses ADC to authenticate with GCP. The Google provider and the GCS backend both
+pick it up automatically from `~/.config/gcloud/`.
+
+[How Application Default Credentials works](https://docs.cloud.google.com/docs/authentication/application-default-credentials) | [`gcloud auth application-default login` reference](https://docs.cloud.google.com/sdk/gcloud/reference/auth/application-default/login)
 
 ```bash
 gcloud auth application-default login
 ```
 
+This opens a browser for OAuth login. The resulting token is what OpenTofu uses to deploy
+resources. The service account created in Layer 1 is a separate thing — that is what the
+cluster nodes use at runtime.
+
 ---
 
-### Layer 1: GCP Project Configuration (OpenTofu `google` provider)
-
-Everything from here down is managed by OpenTofu.
+### Layer 1: GCP Project Configuration
 
 #### 1a. Enable Required GCP APIs
 
-GCP APIs must be explicitly enabled before any resource that uses them can be
-provisioned. OpenTofu manages these with `google_project_service` and `for_each`.
+GCP APIs must be explicitly enabled before any resource that depends on them can be
+provisioned. `for_each` iterates over a set of values and creates one resource instance per
+value — this is more maintainable than five separate resource blocks.
 
-`for_each` docs: https://opentofu.org/docs/language/meta-arguments/for_each/
+[`for_each` docs](https://opentofu.org/docs/language/meta-arguments/for_each/)
 
+**`provisioning/opentofu/main.tf`**
 ```hcl
 resource "google_project_service" "apis" {
   for_each = toset([
@@ -123,18 +377,24 @@ resource "google_project_service" "apis" {
 
   project            = var.project_id
   service            = each.value
-  disable_on_destroy = false  # Don't disable APIs on tofu destroy
+  disable_on_destroy = false  # Don't disable APIs on tofu destroy — other things in the project may depend on them
 }
 ```
 
-`disable_on_destroy = false` is deliberate: disabling APIs on destroy can break
-other things in the project that depend on them.
-
 #### 1b. Service Account for the GKE Node Pool
 
-Instead of giving node VMs the default Compute Engine service account (which has
-wildly excessive permissions), we create a minimal service account via OpenTofu.
+The default Compute Engine service account that GKE nodes would otherwise use has far too
+many permissions. This creates a purpose-built, minimal service account.
 
+These three roles are the minimum a GKE node pool service account needs:
+
+| Role | Purpose |
+|---|---|
+| `roles/logging.logWriter` | Write container logs to Cloud Logging |
+| `roles/monitoring.metricWriter` | Write metrics to Cloud Monitoring |
+| `roles/artifactregistry.reader` | Pull container images from Artifact Registry |
+
+**`provisioning/opentofu/modules/gke/main.tf`**
 ```hcl
 resource "google_service_account" "gke_nodes" {
   account_id   = "sandbox-gke-nodes"
@@ -161,87 +421,98 @@ resource "google_project_iam_member" "gke_nodes_registry_reader" {
 }
 ```
 
-These three roles are the minimum a GKE node pool SA needs: write logs, write
-metrics, and pull images from Artifact Registry.
-
 ---
 
 ### Layer 2: Networking (`modules/vpc/`)
 
-Never use the GCP default VPC. OpenTofu manages a dedicated VPC and subnet.
+Never use the GCP default VPC — it uses auto-mode subnets that do not give you control over
+IP ranges. OpenTofu manages a dedicated VPC and subnet with explicit CIDR ranges.
 
+GKE requires **secondary IP ranges** on the subnet when using VPC-native (alias IP)
+networking — one range for pod IPs and one for service IPs. These ranges are declared on
+the subnet here in Layer 2, and referenced by name in the cluster config in Layer 3.
+
+**`provisioning/opentofu/modules/vpc/main.tf`**
 ```hcl
 resource "google_compute_network" "vpc" {
   name                    = "sandbox-gke-vpc"
-  auto_create_subnetworks = false  # We create subnets explicitly
+  auto_create_subnetworks = false  # No auto-mode — create subnets explicitly
   project                 = var.project_id
 }
 
 resource "google_compute_subnetwork" "primary" {
   name          = "sandbox-gke-subnet"
-  ip_cidr_range = "10.10.0.0/24"
+  ip_cidr_range = "10.10.0.0/24"   # node IPs — up to 254 nodes
   region        = var.region
   network       = google_compute_network.vpc.id
   project       = var.project_id
 
   secondary_ip_range {
     range_name    = "pods"
-    ip_cidr_range = "10.20.0.0/16"
+    ip_cidr_range = "10.20.0.0/16"   # up to 65,536 pod IPs
   }
 
   secondary_ip_range {
     range_name    = "services"
-    ip_cidr_range = "10.30.0.0/16"
+    ip_cidr_range = "10.30.0.0/16"   # up to 65,536 service IPs
   }
 }
 ```
 
-GKE requires secondary ranges for pods and services when using VPC-native
-(alias IP) networking. These are declared here and referenced by the cluster
-config in Layer 3.
+**`provisioning/opentofu/modules/vpc/outputs.tf`**
+```hcl
+output "network_id" {
+  value = google_compute_network.vpc.id
+}
+
+output "subnetwork_id" {
+  value = google_compute_subnetwork.primary.id
+}
+```
 
 ---
 
 ### Layer 3: GKE Cluster + Node Pool (`modules/gke/`)
 
-Provider registry for all `google_*` resources:
-https://search.opentofu.org/provider/opentofu/google/
+[Google provider registry](https://search.opentofu.org/provider/opentofu/google/)
 
 #### The Cluster
 
+**`provisioning/opentofu/modules/gke/main.tf`** (cluster block)
 ```hcl
 resource "google_container_cluster" "primary" {
   name     = "sandbox-gke"
-  location = var.zone   # zonal cluster; cheaper than regional
+  location = var.zone   # zonal cluster — one control plane, cheaper than regional (3 control planes)
   project  = var.project_id
 
-  # We manage the node pool separately; remove the default one
+  # Remove the default node pool immediately after cluster creation.
+  # We manage the node pool as a separate resource for more explicit control.
   remove_default_node_pool = true
-  initial_node_count       = 1
+  initial_node_count       = 1   # required even when removing the default pool
 
   network    = var.network_id
   subnetwork = var.subnetwork_id
 
   ip_allocation_policy {
-    cluster_secondary_range_name  = "pods"
+    cluster_secondary_range_name  = "pods"      # references the secondary range name from the subnet
     services_secondary_range_name = "services"
   }
 
   workload_identity_config {
-    workload_pool = "${var.project_id}.svc.id.goog"
+    workload_pool = "${var.project_id}.svc.id.goog"   # enables Workload Identity on the cluster
   }
 
   lifecycle {
-    prevent_destroy = false  # flip to true once you're happy with it
+    prevent_destroy = false  # flip to true once you are happy with the cluster configuration
   }
 }
 ```
 
-`lifecycle` and `prevent_destroy` docs:
-https://opentofu.org/docs/language/resources/behavior/
+[`lifecycle` and `prevent_destroy` docs](https://opentofu.org/docs/language/resources/behavior/)
 
 #### The Node Pool
 
+**`provisioning/opentofu/modules/gke/main.tf`** (node pool block)
 ```hcl
 resource "google_container_node_pool" "primary" {
   name     = "sandbox-gke-nodes"
@@ -256,13 +527,13 @@ resource "google_container_node_pool" "primary" {
 
   node_config {
     machine_type = "e2-standard-2"
-    spot         = true  # preemptible; ~70% cost reduction
+    spot         = true  # preemptible VMs — ~70% cost reduction; GKE restarts pods if a node is reclaimed
 
     service_account = var.node_sa_email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
 
     workload_metadata_config {
-      mode = "GKE_METADATA"  # required for Workload Identity
+      mode = "GKE_METADATA"  # required for Workload Identity — prevents pods from reaching the node metadata server directly
     }
   }
 
@@ -270,28 +541,46 @@ resource "google_container_node_pool" "primary" {
 }
 ```
 
-`depends_on` docs:
-https://opentofu.org/docs/language/meta-arguments/depends_on/
+[`depends_on` docs](https://opentofu.org/docs/language/meta-arguments/depends_on/)
 
-The `depends_on` meta-argument handles hidden dependencies that OpenTofu cannot
-automatically infer. The docs note it should be used as a last resort because it
-causes more conservative plans. Here it's justified: the node pool resource doesn't
-directly reference enough cluster attributes for OpenTofu to infer the ordering
-reliably across all plan scenarios.
+`depends_on` is a last resort for dependencies OpenTofu cannot infer from resource references.
+The docs note it causes more conservative plans. It is justified here: the node pool does
+not reference enough cluster attributes for OpenTofu to reliably infer the ordering across
+all plan scenarios.
+
+#### GKE Module Outputs
+
+**`provisioning/opentofu/modules/gke/outputs.tf`**
+```hcl
+output "endpoint" {
+  value     = google_container_cluster.primary.endpoint
+  sensitive = true   # contains a routable IP — not printed in plain text during tofu apply
+}
+
+output "ca_certificate" {
+  value     = google_container_cluster.primary.master_auth[0].cluster_ca_certificate
+  sensitive = true
+}
+
+output "node_sa_email" {
+  value = google_service_account.gke_nodes.email
+}
+```
 
 ---
 
 ### Layer 4: Workload Identity (`modules/gke/`)
 
-Workload Identity is how GKE pods authenticate to GCP APIs without key files.
-The mechanism: a Kubernetes service account (KSA) is annotated with a GCP
-service account (GSA) email, and an IAM binding allows the KSA to impersonate
-the GSA. OpenTofu manages both sides.
+[Authenticate to Google Cloud APIs from GKE workloads](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
 
-For ArgoCD itself, no GCP API access is needed. But the pattern is worth wiring
-up for any future workload that does need it (e.g. External Secrets Operator
-talking to GCP Secret Manager):
+Workload Identity is how GKE pods authenticate to GCP APIs without key files. The mechanism:
+a Kubernetes service account (KSA) is annotated with a GCP service account (GSA) email, and
+an IAM binding allows the KSA to impersonate the GSA. OpenTofu manages the GCP side.
 
+ArgoCD itself does not need GCP API access, but this wires up the pattern for future
+workloads that do (e.g. External Secrets Operator reading from GCP Secret Manager).
+
+**`provisioning/opentofu/modules/gke/main.tf`** (workload identity block)
 ```hcl
 resource "google_service_account" "workload" {
   account_id   = "sandbox-gke-workload"
@@ -302,11 +591,16 @@ resource "google_service_account" "workload" {
 resource "google_service_account_iam_member" "workload_identity_binding" {
   service_account_id = google_service_account.workload.name
   role               = "roles/iam.workloadIdentityUser"
-  member = "serviceAccount:${var.project_id}.svc.id.goog[${var.k8s_namespace}/${var.k8s_sa_name}]"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.k8s_namespace}/${var.k8s_sa_name}]"
 }
 ```
 
-The corresponding annotation on the KSA (managed in `sandbox-gitops`, not here):
+The `member` string is the Workload Identity federation format:
+`serviceAccount:<project>.svc.id.goog[<namespace>/<kubernetes-service-account>]`
+
+The corresponding annotation on the Kubernetes side (managed in `gitops/`, deployed by
+ArgoCD — not by OpenTofu):
+
 ```yaml
 apiVersion: v1
 kind: ServiceAccount
@@ -319,30 +613,31 @@ metadata:
 
 ### Layer 5: ArgoCD Bootstrap (`modules/bootstrap/`)
 
-This is where provider chaining becomes the central HCL concept.
-
 #### The Provider Chaining Problem
 
-The `kubernetes` and `helm` providers need the GKE cluster's endpoint and CA
-certificate -- values that don't exist until the cluster is provisioned. This
-creates a sequencing problem.
+The `kubernetes` and `helm` providers need the GKE cluster's endpoint and CA certificate.
+Those values do not exist until the cluster is provisioned. This creates a sequencing
+problem that OpenTofu solves through **provider chaining**.
 
-Provider configuration docs:
-https://opentofu.org/docs/language/modules/develop/providers/
+[Provider configuration docs](https://opentofu.org/docs/language/modules/develop/providers/)
 
-Key rule from the docs: provider configurations can be **defined only in the
-root module**. Child modules cannot contain provider blocks if they are to be
-compatible with `for_each`, `count`, and `depends_on` meta-arguments.
+Key rule from the docs: **provider configurations can be defined only in the root module.**
+Child modules cannot contain `provider` blocks — if they did, the module would be
+incompatible with `for_each`, `count`, and `depends_on` meta-arguments.
 
-The pattern in `providers.tf`:
+The `module.gke.endpoint` reference in the provider block creates an **implicit dependency**
+— OpenTofu knows it must complete the `gke` module before it can configure the `kubernetes`
+and `helm` providers.
 
+**`provisioning/opentofu/providers.tf`**
 ```hcl
 provider "google" {
   project = var.project_id
   region  = var.region
 }
 
-# data source: gets a short-lived OAuth token for the current ADC identity
+# Data source: fetches a short-lived OAuth access token for the current ADC identity.
+# Data sources are read-only — they look things up, they don't create anything.
 data "google_client_config" "default" {}
 
 provider "kubernetes" {
@@ -360,60 +655,59 @@ provider "helm" {
 }
 ```
 
-The `module.gke.endpoint` reference creates an implicit dependency -- OpenTofu
-knows it must run the `gke` module before configuring the `kubernetes` and `helm`
-providers. You will also need an explicit `depends_on` on the `bootstrap` module
-to guarantee the node pool is Ready (not just the control plane) before Helm tries
-to install ArgoCD:
+[Data sources docs](https://opentofu.org/docs/language/data-sources/)
 
-```hcl
-module "bootstrap" {
-  source          = "./modules/bootstrap"
-  gitops_repo_url = var.gitops_repo_url
-
-  depends_on = [module.gke]  # wait for the full gke module, including node pool
-}
-```
-
-When `depends_on` is applied to a module block, it affects the ordering of **all**
-resources within that module.
-Docs: https://opentofu.org/docs/language/modules/syntax/
+`google_client_config` is a data source that reads (but does not create) the current OAuth
+access token from your ADC credentials.
 
 #### ArgoCD via Helm
 
+Pin the chart version to something specific before applying — `7.x.x` is a placeholder.
+Look up the current release at [artifacthub.io](https://artifacthub.io/packages/helm/argo-cd-charts/argo-cd).
+
+**`provisioning/opentofu/modules/bootstrap/main.tf`**
 ```hcl
 resource "helm_release" "argocd" {
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
   chart            = "argo-cd"
-  version          = "7.x.x"   # pin this
+  version          = "7.x.x"   # pin to a specific version before applying
   namespace        = "argocd"
   create_namespace = true
 
   set {
     name  = "server.service.type"
-    value = "ClusterIP"  # no external LoadBalancer for a sandbox
+    value = "ClusterIP"  # no external LoadBalancer — use kubectl port-forward in a sandbox
   }
 }
 ```
 
-#### Initial ArgoCD Application pointing at `sandbox-gitops`
+#### Initial ArgoCD Application (root-app)
 
+This is the single Kubernetes manifest OpenTofu creates in the cluster. It points ArgoCD
+at `gitops/cluster/` in this repo. From there, ArgoCD takes over and self-assembles the
+rest of the cluster via ApplicationSets.
+
+The content matches `gitops/bootstrap/root-app.yaml` (which exists in this repo as a
+reference copy of what this resource deploys). The only templated value is `repoURL`.
+
+**`provisioning/opentofu/modules/bootstrap/main.tf`** (continued)
 ```hcl
 resource "kubernetes_manifest" "argocd_app" {
   manifest = {
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
-      name      = "sandbox-gitops"
+      name      = "cluster-root"
       namespace = "argocd"
+      finalizers = ["resources-finalizer.argocd.argoproj.io"]   # cascade-delete: removing this Application also removes everything it manages
     }
     spec = {
       project = "default"
       source = {
         repoURL        = var.gitops_repo_url
-        targetRevision = "main"
-        path           = "."
+        targetRevision = "HEAD"
+        path           = "gitops/cluster"   # the kustomization + three ApplicationSets
       }
       destination = {
         server    = "https://kubernetes.default.svc"
@@ -424,94 +718,43 @@ resource "kubernetes_manifest" "argocd_app" {
           prune    = true
           selfHeal = true
         }
+        syncOptions = [
+          "CreateNamespace=true",
+          "ServerSideApply=true",
+        ]
       }
     }
   }
 
-  depends_on = [helm_release.argocd]
+  depends_on = [helm_release.argocd]   # ArgoCD CRDs must exist before an Application CRD can be created
 }
 ```
 
-From this point, ArgoCD takes over. The cluster self-assembles from
-`sandbox-gitops` -- cloud edition.
-
 ---
 
-## Backend Configuration
+### Root Module Calls
 
-Backend configuration docs:
-https://opentofu.org/docs/language/settings/backends/configuration/
+This wires the three modules together. The root module passes outputs from one module as
+inputs to another — this is called flat composition.
 
-GCS backend docs:
-https://opentofu.org/docs/language/settings/backends/gcs/
+[Module composition docs](https://opentofu.org/docs/language/modules/develop/composition/)
 
+**`provisioning/opentofu/main.tf`**
 ```hcl
-# backend.tf
-terraform {
-  backend "gcs" {
-    bucket = "sandbox-gke-tofu-state"
-    prefix = "sandbox-gke/opentofu"
-  }
+resource "google_project_service" "apis" {
+  for_each = toset([
+    "container.googleapis.com",
+    "compute.googleapis.com",
+    "iam.googleapis.com",
+    "cloudresourcemanager.googleapis.com",
+    "storage.googleapis.com",
+  ])
+
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
 }
-```
 
-The docs recommend using environment variables for credentials, not hardcoding
-them. With ADC configured locally, no additional credential configuration is
-needed for the GCS backend -- it picks up ADC automatically.
-
-GCS supports state locking natively via GCS object metadata. No separate
-DynamoDB table required (unlike S3). Locking prevents concurrent `tofu apply`
-runs from corrupting state.
-
-GCS backend supports OpenTofu workspaces:
-https://opentofu.org/docs/language/state/workspaces/
-
-The docs are explicit: workspaces are **not** appropriate for managing
-fundamentally different environments with different credentials. For that, use
-separate root modules with separate backends. For this sandbox, a single
-workspace is correct.
-
----
-
-## Module Structure
-
-Standard module structure docs:
-https://opentofu.org/docs/language/modules/develop/structure/
-
-Module blocks docs:
-https://opentofu.org/docs/language/modules/syntax/
-
-```
-provisioning/opentofu/
-├── backend.tf          # GCS backend config
-├── providers.tf        # all provider blocks (root module only)
-├── variables.tf        # root module input variables
-├── outputs.tf          # root module outputs
-├── main.tf             # module calls and top-level resources (API enablement, etc.)
-└── modules/
-    ├── vpc/
-    │   ├── main.tf
-    │   ├── variables.tf
-    │   └── outputs.tf
-    ├── gke/
-    │   ├── main.tf      # cluster, node pool, service account, IAM
-    │   ├── variables.tf
-    │   └── outputs.tf   # endpoint, ca_certificate, node_sa_email
-    └── bootstrap/
-        ├── main.tf      # helm_release argocd, kubernetes_manifest argocd app
-        ├── variables.tf
-        └── outputs.tf
-```
-
-Per the docs, `main.tf`, `variables.tf`, `outputs.tf` are the recommended
-filenames for a minimal module, even if they're empty.
-
-Key rule: provider configurations can be **defined only in the root module**.
-https://opentofu.org/docs/language/modules/develop/providers/
-
-Module calls in `main.tf`:
-
-```hcl
 module "vpc" {
   source     = "./modules/vpc"
   project_id = var.project_id
@@ -525,33 +768,63 @@ module "gke" {
   network_id    = module.vpc.network_id
   subnetwork_id = module.vpc.subnetwork_id
 
-  depends_on = [google_project_service.apis]
+  depends_on = [google_project_service.apis]   # APIs must be enabled before GKE can be created
 }
 
 module "bootstrap" {
   source          = "./modules/bootstrap"
   gitops_repo_url = var.gitops_repo_url
 
-  depends_on = [module.gke]
+  depends_on = [module.gke]   # wait for the full gke module (including node pool Ready) before Helm installs ArgoCD
 }
 ```
 
-Module composition pattern docs:
-https://opentofu.org/docs/language/modules/develop/composition/
+When `depends_on` is applied to a module block, it affects the ordering of **all** resources
+within that module.
 
-The root module wires child modules together by passing outputs from one as inputs
-to another. This is called "flat composition" -- preferred over deeply nested
-module trees.
+[Module syntax docs](https://opentofu.org/docs/language/modules/syntax/)
+
+---
+
+## Backend Configuration
+
+[Backend configuration docs](https://opentofu.org/docs/language/settings/backends/configuration/)  
+[GCS backend docs](https://opentofu.org/docs/language/settings/backends/gcs/)
+
+**`provisioning/opentofu/backend.tf`**
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "sandbox-gke-tofu-state"
+    prefix = "sandbox-gke/opentofu"
+  }
+}
+```
+
+The state file will live at:
+`gs://sandbox-gke-tofu-state/sandbox-gke/opentofu/default.tfstate`
+
+**State locking:** GCS locks state natively via object metadata. This prevents two concurrent
+`tofu apply` runs from corrupting the state file. No separate DynamoDB table is needed
+(that is an S3/AWS requirement).
+
+**Authentication:** With ADC configured locally, no additional credential configuration is
+needed in `backend.tf` — the GCS backend picks up ADC automatically.
+
+**Workspaces:** GCS supports OpenTofu workspaces, but the docs are explicit that workspaces
+are **not** the right tool for managing fundamentally different environments with different
+credentials. For this sandbox, a single workspace is correct.
+
+[Workspaces docs](https://opentofu.org/docs/language/state/workspaces/)
 
 ---
 
 ## Variables and Outputs
 
-Variables docs: https://opentofu.org/docs/language/values/variables/
-Outputs docs: https://opentofu.org/docs/language/values/outputs/
+[Variables docs](https://opentofu.org/docs/language/values/variables/)  
+[Outputs docs](https://opentofu.org/docs/language/values/outputs/)
 
-Root `variables.tf`:
-
+**`provisioning/opentofu/variables.tf`**
 ```hcl
 variable "project_id" {
   type        = string
@@ -566,31 +839,30 @@ variable "region" {
 
 variable "zone" {
   type        = string
-  description = "GCP zone for zonal GKE cluster"
+  description = "GCP zone for the zonal GKE cluster"
   default     = "us-east1-b"
 }
 
 variable "gitops_repo_url" {
   type        = string
-  description = "URL of the sandbox-gitops Git repository"
+  description = "URL of this repo — ArgoCD points at gitops/cluster/ after bootstrap"
 }
 ```
 
-Supply values via a `terraform.tfvars` file (gitignored) or environment variables
-(`TF_VAR_project_id`, etc.):
-
+**`provisioning/opentofu/terraform.tfvars`** (gitignored — never commit this file)
 ```hcl
-# terraform.tfvars  <-- add to .gitignore
 project_id      = "terraform-sandbox"
-gitops_repo_url = "https://github.com/yourname/sandbox-gitops"
+gitops_repo_url = "https://github.com/<your-username>/sandbox-gke"
 ```
 
-Root `outputs.tf`:
+Values can also be passed as environment variables (`TF_VAR_project_id`, etc.) if you prefer
+not to use a `.tfvars` file.
 
+**`provisioning/opentofu/outputs.tf`**
 ```hcl
 output "cluster_endpoint" {
   value     = module.gke.endpoint
-  sensitive = true  # contains a routable IP; mark sensitive
+  sensitive = true   # marked sensitive — not printed in plain text during tofu apply
 }
 
 output "cluster_ca_certificate" {
@@ -598,6 +870,7 @@ output "cluster_ca_certificate" {
   sensitive = true
 }
 
+# Run: tofu output get_credentials_command — then paste the result into your terminal
 output "get_credentials_command" {
   value = "gcloud container clusters get-credentials sandbox-gke --zone ${var.zone} --project ${var.project_id}"
 }
@@ -605,15 +878,20 @@ output "get_credentials_command" {
 
 ---
 
-## IAM Audit (Do This Before Writing HCL)
+## IAM Audit
 
-The recycled `terraform-sandbox` service account may have accumulated broad roles.
+Do this before writing any HCL. The recycled `terraform-sandbox` account may have
+accumulated broad roles.
+
+[`gcloud projects get-iam-policy` reference](https://docs.cloud.google.com/sdk/gcloud/reference/projects/get-iam-policy) | [`gcloud auth list` reference](https://docs.cloud.google.com/sdk/gcloud/reference/auth/list)
 
 ```bash
+# Check what roles your ADC identity has on the project
+# (find your ADC email with: gcloud auth list)
 gcloud projects get-iam-policy terraform-sandbox \
   --flatten="bindings[].members" \
   --format="table(bindings.role)" \
-  --filter="bindings.members:<SA_EMAIL>"
+  --filter="bindings.members:<YOUR_EMAIL>"
 ```
 
 Minimum roles required for OpenTofu to run this configuration:
@@ -623,60 +901,97 @@ Minimum roles required for OpenTofu to run this configuration:
 | `roles/container.admin` | GKE cluster and node pool |
 | `roles/compute.networkAdmin` | VPC, subnets |
 | `roles/iam.serviceAccountAdmin` | Create and manage service accounts |
-| `roles/iam.serviceAccountUser` | Bind SAs to resources |
+| `roles/iam.serviceAccountUser` | Bind service accounts to resources |
 | `roles/resourcemanager.projectIamAdmin` | Manage IAM bindings |
 | `roles/serviceusage.serviceUsageAdmin` | Enable APIs |
 | `roles/storage.admin` | GCS state bucket |
 
-If the SA has `roles/editor` or `roles/owner`: downscope it. A service account
-with Owner sitting in a `.tfvars` file -- even gitignored -- is a liability.
+[IAM predefined roles reference](https://docs.cloud.google.com/iam/docs/understanding-roles)
+
+> **If your identity has `roles/editor` or `roles/owner`: downscope it.** A broad role on
+> `terraform-sandbox` — even protected only by a gitignored `.tfvars` file — is a liability.
 
 ---
 
 ## Cost and Spend Management
 
-GKE Standard control plane: **$0.10/hour** (~$73/month) regardless of nodes.
-Node pool (e2-standard-2, spot, 1 node minimum): **~$0.02/hour** (~$14/month).
-Total running cost: **~$0.12/hour** at minimum scale.
+| Resource | Cost |
+|---|---|
+| GKE Standard control plane | $0.10/hr (~$73/mo) |
+| e2-standard-2 spot node (1 node minimum) | ~$0.02/hr (~$14/mo) |
+| **Total at minimum scale** | **~$0.12/hr** |
 
-With $310 in credits and disciplined teardown, this effectively never runs out.
+- Set GCP billing alerts at $50 and $100 (Console → Billing → Budgets & Alerts)
+- **Run `tofu destroy` when done for the day**
+- `tofu apply` from scratch: ~8–10 minutes. `tofu destroy`: ~5 minutes.
+- The GCS state bucket costs essentially nothing and should be kept between sessions.
 
-- Set GCP billing alerts at $50 and $100 in the console
-- **`tofu destroy` when done**
-- A `tofu apply` from scratch takes ~8-10 minutes. `tofu destroy` takes ~5.
+With $310 in credits and disciplined teardown, this project effectively never runs out.
+
+---
+
+## OpenTofu Core Concepts
+
+Quick reference to the official docs for every concept this project exercises.
+
+### The Core Workflow
+
+[Core workflow docs](https://opentofu.org/docs/intro/core-workflow/)
+
+Write → Plan → Apply. Every `tofu` operation follows this loop.
+
+| Command | What it does |
+|---|---|
+| `tofu init` | Initializes the working directory. Downloads providers, installs modules, connects to the GCS backend. Run this first, and again whenever you add or change a provider or module. |
+| `tofu validate` | Syntax-checks all HCL without touching any APIs. Run this after every edit. |
+| `tofu fmt` | Auto-formats HCL to canonical style. Use `-recursive` to cover all modules. |
+| `tofu plan` | Generates and previews an execution plan. No infrastructure is created or changed. |
+| `tofu apply` | Executes the plan. Prompts for confirmation. |
+| `tofu destroy` | Tears down all managed infrastructure. |
+| `tofu output` | Prints output values from the root module. |
+| `tofu state` | Inspect and manipulate state (advanced). |
+
+[CLI reference](https://opentofu.org/docs/cli/commands/)
+
+### The Language Reference
+
+[Language reference](https://opentofu.org/docs/language/)
+
+Every construct used in this project — `resource`, `variable`, `output`, `locals`, `module`,
+`data`, `provider` — is documented here. Keep this open in a tab while writing HCL.
 
 ---
 
 ## Learning Objectives
 
-Ordered by the concepts this project exercises, with doc references:
+Ordered by the concepts this project exercises, with doc references.
 
-1. **HCL language fundamentals** -- resources, variables, locals, outputs, expressions, `for_each`
-   https://opentofu.org/docs/language/
+1. **HCL language fundamentals** — resources, variables, locals, outputs, expressions, `for_each`  
+   [https://opentofu.org/docs/language/](https://opentofu.org/docs/language/)
 
-2. **Provider configuration and chaining** -- providers are root-module-only; child
-   modules inherit them or receive them via the `providers` meta-argument
-   https://opentofu.org/docs/language/modules/develop/providers/
+2. **Provider configuration and chaining** — providers are root-module-only; child modules
+   inherit them or receive them via the `providers` meta-argument  
+   [https://opentofu.org/docs/language/modules/develop/providers/](https://opentofu.org/docs/language/modules/develop/providers/)
 
-3. **Module structure and composition** -- flat composition: root module wires child
-   modules together by passing outputs as inputs
-   https://opentofu.org/docs/language/modules/develop/composition/
+3. **Module structure and composition** — flat composition: root module wires child modules
+   together by passing outputs as inputs  
+   [https://opentofu.org/docs/language/modules/develop/composition/](https://opentofu.org/docs/language/modules/develop/composition/)
 
-4. **`depends_on` -- when and why** -- for hidden dependencies OpenTofu can't infer;
-   at the module level it affects ordering of all resources in that module
-   https://opentofu.org/docs/language/meta-arguments/depends_on/
+4. **`depends_on` — when and why** — for hidden dependencies OpenTofu cannot infer; at the
+   module level it affects the ordering of all resources in that module  
+   [https://opentofu.org/docs/language/meta-arguments/depends_on/](https://opentofu.org/docs/language/meta-arguments/depends_on/)
 
-5. **Remote state with GCS backend** -- state locking, versioning, the bootstrap exception
-   https://opentofu.org/docs/language/settings/backends/gcs/
+5. **Remote state with GCS backend** — state locking, versioning, the bootstrap exception  
+   [https://opentofu.org/docs/language/settings/backends/gcs/](https://opentofu.org/docs/language/settings/backends/gcs/)
 
-6. **Resource lifecycle** -- `prevent_destroy`, `create_before_destroy`, `ignore_changes`
-   https://opentofu.org/docs/language/resources/behavior/
+6. **Resource lifecycle** — `prevent_destroy`, `create_before_destroy`, `ignore_changes`  
+   [https://opentofu.org/docs/language/resources/behavior/](https://opentofu.org/docs/language/resources/behavior/)
 
-7. **Data sources** -- `google_client_config.default` is a data source; read-only
-   lookup of the current OAuth token, used to authenticate kubernetes/helm providers
-   https://opentofu.org/docs/language/data-sources/
+7. **Data sources** — `google_client_config.default` is a data source; reads the current OAuth
+   token for use in the `kubernetes` and `helm` providers  
+   [https://opentofu.org/docs/language/data-sources/](https://opentofu.org/docs/language/data-sources/)
 
-8. **Workload Identity** -- the IAM binding pattern with the
+8. **Workload Identity** — IAM binding pattern with the
    `serviceAccount:PROJECT.svc.id.goog[NS/KSA]` member format
 
 ---
@@ -685,21 +1000,20 @@ Ordered by the concepts this project exercises, with doc references:
 
 | Provider | Registry |
 |---|---|
-| `hashicorp/google` | https://search.opentofu.org/provider/opentofu/google/ |
-| `hashicorp/kubernetes` | https://search.opentofu.org/provider/opentofu/kubernetes/ |
-| `hashicorp/helm` | https://search.opentofu.org/provider/opentofu/helm/ |
+| `hashicorp/google` | [https://search.opentofu.org/provider/opentofu/google/](https://search.opentofu.org/provider/opentofu/google/) |
+| `hashicorp/kubernetes` | [https://search.opentofu.org/provider/opentofu/kubernetes/](https://search.opentofu.org/provider/opentofu/kubernetes/) |
+| `hashicorp/helm` | [https://search.opentofu.org/provider/opentofu/helm/](https://search.opentofu.org/provider/opentofu/helm/) |
 
-OpenTofu Registry: https://search.opentofu.org
+OpenTofu Registry: [https://search.opentofu.org](https://search.opentofu.org)
 
 ---
 
 ## Appendix: Pulumi/Python Alternative
 
-The same infrastructure expressed in Pulumi/Python eliminates the provider chaining
-problem: GKE cluster outputs are Python variables that resolve asynchronously via
-`pulumi.Output[T]`. No `depends_on` gymnastics required. The tradeoff is a different
-mental model (async output graph vs declarative HCL).
+The same infrastructure expressed in Pulumi/Python eliminates the provider chaining problem:
+GKE cluster outputs are Python variables that resolve asynchronously via `pulumi.Output[T]`.
+No `depends_on` gymnastics required. The tradeoff is a different mental model (async output
+graph vs declarative HCL).
 
-Deferred until the OpenTofu version is working and you feel like it. Stack would
-live in `provisioning/pulumi/` alongside the OpenTofu configuration, pointing at
-the same GCS bucket with a different prefix.
+Deferred until the OpenTofu version is working. Stack would live in `provisioning/pulumi/`
+alongside the OpenTofu configuration, pointing at the same GCS bucket with a different prefix.
