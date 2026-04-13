@@ -1,0 +1,98 @@
+# kube-prometheus-stack values
+# Scope: all keys live under `kube-prometheus-stack:` because this is an umbrella chart.
+# Full values reference: https://github.com/prometheus-community/helm-charts/blob/main/charts/kube-prometheus-stack/values.yaml
+kube-prometheus-stack:
+
+  # ── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    # No ingress — access via: kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring
+    # Then open http://localhost:3000  (admin / prom-operator)
+    adminPassword: prom-operator
+
+    # Pre-wire all three signal backends so dashboards work out of the box.
+    additionalDataSources:
+      - name: Loki
+        type: loki
+        url: http://loki.monitoring.svc.cluster.local:3100
+        access: proxy
+        isDefault: false
+        jsonData:
+          maxLines: 1000
+
+      - name: Tempo
+        type: tempo
+        url: http://tempo.monitoring.svc.cluster.local:3200
+        access: proxy
+        isDefault: false
+        jsonData:
+          # Trace → logs correlation: clicking a trace ID in Tempo opens Loki
+          tracesToLogsV2:
+            datasourceUid: loki
+            spanStartTimeShift: "1m"
+            spanEndTimeShift: "-1m"
+            filterByTraceID: false
+            filterBySpanID: false
+          # Log → traces correlation: clicking a trace ID in Loki opens Tempo
+          lokiSearch:
+            datasourceUid: loki
+          # Service map: Prometheus powers the node graph in Tempo
+          serviceMap:
+            datasourceUid: prometheus
+          nodeGraph:
+            enabled: true
+
+    sidecar:
+      dashboards:
+        enabled: true        # auto-imports ConfigMaps labelled grafana_dashboard=1
+        searchNamespace: ALL # look in every namespace, not just monitoring
+
+  # ── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    prometheusSpec:
+      # Discover ServiceMonitors and PodMonitors in any namespace.
+      # Default (nil selector) scopes to the same namespace as Prometheus.
+      # Setting empty {} means "select all labels" = cluster-wide discovery.
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+
+      # Enable Prometheus as a remote_write receiver.
+      # Alloy's span-metrics pipeline writes derived RED metrics here via:
+      #   http://prometheus-operated.monitoring.svc.cluster.local:9090/api/v1/write
+      enableRemoteWriteReceiver: true
+
+      # Retain 7 days of metrics — plenty for a sandbox.
+      retention: 7d
+
+      # Sandbox storage: 20Gi on the default GKE StorageClass (standard-rwo).
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 20Gi
+
+  # ── Alertmanager ─────────────────────────────────────────────────────────────
+  alertmanager:
+    alertmanagerSpec:
+      storage:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 2Gi
+
+  # ── node-exporter ────────────────────────────────────────────────────────────
+  # GKE nodes are managed — some host paths don't exist. Tolerate missing mounts.
+  prometheus-node-exporter:
+    extraArgs:
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+      - --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|bpf|cgroup2?|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$
+
+  # ── kube-state-metrics ───────────────────────────────────────────────────────
+  kube-state-metrics:
+    metricLabelsAllowlist:
+      - pods=[*]
+      - deployments=[app.kubernetes.io/name,app.kubernetes.io/component,app.kubernetes.io/instance]

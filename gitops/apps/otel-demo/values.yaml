@@ -1,0 +1,81 @@
+# otel-demo values
+# The demo ships with its own observability stack (Jaeger, Prometheus, Grafana, OpenSearch).
+# We disable all of that — the cluster has LGTA. The demo's internal OTel Collector
+# is reconfigured to forward signals to Alloy, which routes them to the right backends.
+#
+# Signal flow:
+#   demo services → demo's internal otel-collector → Alloy (otlp gRPC) → Loki / Tempo
+#                                                                       → Prometheus (span metrics)
+#
+# Access the demo frontend:
+#   kubectl port-forward svc/otel-demo-frontendproxy 8080:8080 -n otel-demo
+#   Then open http://localhost:8080
+opentelemetry-demo:
+
+  # ── Disable bundled observability ──────────────────────────────────────────
+  # These are replaced by our cluster-level LGTA stack.
+  jaeger:
+    enabled: false
+  prometheus:
+    enabled: false
+  grafana:
+    enabled: false
+  opensearch:
+    enabled: false
+
+  # ── Internal OTel Collector — reconfigure to forward to Alloy ──────────────
+  opentelemetry-collector:
+    # Run as a single Deployment (not DaemonSet — Alloy already covers node-level).
+    mode: deployment
+    replicaCount: 1
+
+    presets:
+      # kubernetesAttributes adds k8s.namespace, k8s.pod.name etc. to every span.
+      # This is what links a trace back to its pod logs in Loki.
+      kubernetesAttributes:
+        enabled: true
+      # Disable node/cluster-level collection — Alloy + kube-prometheus-stack cover these.
+      hostMetrics:
+        enabled: false
+      kubeletMetrics:
+        enabled: false
+      clusterMetrics:
+        enabled: false
+
+    config:
+      exporters:
+        # Forward ALL signals (traces, metrics, logs) to Alloy's OTLP gRPC receiver.
+        # Alloy then routes: traces → Tempo, logs → Loki, span-metrics → Prometheus.
+        otlp/alloy:
+          endpoint: alloy.monitoring.svc.cluster.local:4317
+          tls:
+            insecure: true
+
+        # Drop logs here — Alloy's DaemonSet already reads pod stdout from the node filesystem.
+        # Sending logs twice would double-ingest them in Loki.
+        logging:
+          verbosity: basic
+
+      service:
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+            exporters: [otlp/alloy]
+          metrics:
+            receivers: [otlp]
+            processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+            exporters: [otlp/alloy]
+          logs:
+            receivers: [otlp]
+            processors: [memory_limiter, k8sattributes, resourcedetection, resource, batch]
+            # Drop OTLP logs — pod stdout is already collected by Alloy DaemonSet
+            exporters: [logging]
+
+  # ── Expose the demo frontend ───────────────────────────────────────────────
+  # frontendProxy is the Envoy proxy that fronts the demo's UI and load generator.
+  # Accessible via port-forward: kubectl port-forward svc/otel-demo-frontendproxy 8080:8080 -n otel-demo
+  components:
+    frontendProxy:
+      service:
+        type: ClusterIP  # no external LB — port-forward for sandbox access

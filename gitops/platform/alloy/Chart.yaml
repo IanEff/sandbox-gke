@@ -1,0 +1,12 @@
+apiVersion: v2
+name: alloy
+description: Umbrella chart — Grafana Alloy (OTel collector + log shipper).
+version: 0.1.0
+# Alloy is the successor to Grafana Agent. It handles all three signal types:
+#   metrics (scrape → Prometheus), logs (collect → Loki), traces (receive → Tempo)
+# Latest releases: https://github.com/grafana/alloy/releases
+# Helm chart: https://github.com/grafana/helm-charts/tree/main/charts/alloy
+dependencies:
+  - name: alloy
+    version: "1.7.0"
+    repository: https://grafana.github.io/helm-charts

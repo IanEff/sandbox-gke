@@ -1,0 +1,10 @@
+apiVersion: v2
+name: loki
+description: Umbrella chart — Grafana Loki (single-binary mode for sandbox).
+version: 0.1.0
+# Latest releases: https://github.com/grafana/loki/releases
+# Helm chart changelog: https://github.com/grafana/helm-charts/tree/main/charts/loki
+dependencies:
+  - name: loki
+    version: "6.24.0"
+    repository: https://grafana.github.io/helm-charts

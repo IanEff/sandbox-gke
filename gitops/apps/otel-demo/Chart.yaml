@@ -1,0 +1,18 @@
+apiVersion: v2
+name: otel-demo
+description: Umbrella chart — CNCF OpenTelemetry Demo (bundled observability disabled).
+version: 0.1.0
+# The otel-demo is a polyglot microservices app purpose-built for observability.
+# It emits traces, metrics, and logs across ~20 services in Go, Java, Python, etc.
+# Perfect for exercising the full LGTA stack end-to-end.
+#
+# We disable the demo's bundled Jaeger, Prometheus, Grafana, and OpenSearch because
+# the cluster already has a full observability stack. The demo's internal OTel
+# Collector is reconfigured to forward all signals to Alloy instead.
+#
+# Demo source: https://github.com/open-telemetry/opentelemetry-demo
+# Helm chart: https://github.com/open-telemetry/opentelemetry-helm-charts
+dependencies:
+  - name: opentelemetry-demo
+    version: "0.40.6"
+    repository: https://open-telemetry.github.io/opentelemetry-helm-charts

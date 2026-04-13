@@ -1,0 +1,5 @@
+{
+  "appName": "kube-prometheus-stack",
+  "namespace": "monitoring",
+  "syncWave": "0"
+}

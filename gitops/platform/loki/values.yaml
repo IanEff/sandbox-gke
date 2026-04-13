@@ -1,0 +1,60 @@
+# Loki values — single-binary (monolithic) mode
+# Single-binary runs all Loki components in one pod. Right-sized for a sandbox.
+# For production, swap to deploymentMode: SimpleScalable or Distributed.
+# Full reference: https://grafana.com/docs/loki/latest/setup/install/helm/
+loki:
+  deploymentMode: SingleBinary
+
+  loki:
+    # Disable multi-tenancy — all logs go to the `fake` tenant (Loki default).
+    # For multi-tenant, set true and send X-Scope-OrgID headers from Alloy.
+    auth_enabled: false
+
+    commonConfig:
+      replication_factor: 1  # single replica = no replication overhead
+
+    # Use filesystem storage (PVC-backed). Fine for sandbox.
+    # For production: use GCS backend (gcs.bucketName = your-bucket).
+    storage:
+      type: filesystem
+
+    schemaConfig:
+      configs:
+        - from: "2024-01-01"
+          store: tsdb
+          object_store: filesystem
+          schema: v13  # latest Loki schema as of v3.x
+          index:
+            prefix: index_
+            period: 24h
+
+  # Single-binary component — one replica, one pod
+  singleBinary:
+    replicas: 1
+    persistence:
+      enabled: true
+      size: 10Gi
+      # storageClass: ""  # blank = default GKE StorageClass (standard-rwo)
+
+  # Disable the read/write/backend pods — they're only used in scalable modes.
+  read:
+    replicas: 0
+  write:
+    replicas: 0
+  backend:
+    replicas: 0
+
+  # Disable bundled MinIO — we're using the filesystem backend
+  minio:
+    enabled: false
+
+  # Disable canary and test pods — not needed for sandbox
+  lokiCanary:
+    enabled: false
+  test:
+    enabled: false
+
+  # Disable gateway — Alloy writes directly to the distributor endpoint.
+  # Port: 3100 (HTTP push + query)
+  gateway:
+    enabled: false

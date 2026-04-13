@@ -1,0 +1,46 @@
+# ApplicationSet — platform tier (sync-wave 1)
+#
+# Same pattern as infra-set.yaml but scans gitops/platform/**/config.json.
+# Runs after infra (wave 1), so cert-manager CRDs are available when
+# kube-prometheus-stack tries to install ServiceMonitor/PodMonitor CRDs.
+#
+# Platform apps are Helm-based: each directory has Chart.yaml + values.yaml.
+# ArgoCD renders them with `helm dependency update` + `helm template`.
+# No chart tarballs are vendored — ArgoCD fetches dependencies at sync time.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=default"]
+  generators:
+    - git:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        revision: HEAD
+        files:
+          - path: gitops/platform/**/config.json
+  template:
+    metadata:
+      name: "platform-{{ .appName }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        targetRevision: HEAD
+        path: "{{ .path.path }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

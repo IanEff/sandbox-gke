@@ -1,0 +1,10 @@
+apiVersion: v2
+name: tempo
+description: Umbrella chart — Grafana Tempo (single-binary mode for sandbox).
+version: 0.1.0
+# Latest releases: https://github.com/grafana/tempo/releases
+# Helm chart: https://github.com/grafana/helm-charts/tree/main/charts/tempo
+dependencies:
+  - name: tempo
+    version: "1.14.0"
+    repository: https://grafana.github.io/helm-charts

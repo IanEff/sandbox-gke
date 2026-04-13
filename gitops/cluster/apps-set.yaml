@@ -1,0 +1,46 @@
+# ApplicationSet — apps tier (sync-wave 2)
+#
+# Scans gitops/apps/**/config.json. Runs after platform (wave 2), so the
+# observability stack is up before workloads start generating telemetry.
+#
+# This is where tenant workloads live. To deploy a new app:
+#   1. Create gitops/apps/<name>/
+#   2. Add config.json, Chart.yaml (or kustomization.yaml), values.yaml
+#   3. Commit and push — ArgoCD picks it up within the reconcile interval
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: apps
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=default"]
+  generators:
+    - git:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        revision: HEAD
+        files:
+          - path: gitops/apps/**/config.json
+  template:
+    metadata:
+      name: "app-{{ .appName }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        targetRevision: HEAD
+        path: "{{ .path.path }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

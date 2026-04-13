@@ -1,0 +1,46 @@
+# ApplicationSet — infra tier (sync-wave 0)
+#
+# Scans gitops/infra/**/config.json. Each config.json describes one Application.
+# Required fields: appName, namespace, syncWave.
+# The source path is derived automatically from the config.json file location
+# via {{ .path.path }} — no localPath field needed in config.json.
+#
+# goTemplate: true unlocks Go template syntax and missingkey=default so any
+# field absent from config.json renders as "" rather than erroring.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: infra
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=default"]
+  generators:
+    - git:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        revision: HEAD
+        files:
+          - path: gitops/infra/**/config.json
+  template:
+    metadata:
+      name: "infra-{{ .appName }}"
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{ .syncWave }}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/IanEff/sandbox-gke.git
+        targetRevision: HEAD
+        path: "{{ .path.path }}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{ .namespace }}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

@@ -1,0 +1,231 @@
+# Alloy values
+# Alloy runs as a DaemonSet — one pod per node — so it can read pod logs from
+# the node's filesystem without network hops. It handles two signal types:
+#
+#   LOGS:   discovers all pods via Kubernetes API, reads logs from /var/log/pods,
+#           enriches with k8s labels, ships to Loki.
+#
+#   TRACES: exposes an OTLP gRPC receiver (port 4317) and HTTP receiver (port 4318).
+#           Apps and the otel-demo collector forward spans here.
+#           Alloy extracts span metrics (RED: rate/error/duration), writes them to
+#           Prometheus via remote_write, then forwards raw spans to Tempo.
+#
+#   NOTE on metrics: kube-prometheus-stack's Prometheus handles metric scraping
+#   via ServiceMonitor/PodMonitor CRDs. Alloy does NOT duplicate that work.
+#   The only metric path through Alloy is span → spanmetrics → Prometheus remote_write.
+#
+# Full Alloy config reference: https://grafana.com/docs/alloy/latest/reference/
+alloy:
+  controller:
+    type: daemonset
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+  alloy:
+    configMap:
+      create: true
+      content: |
+        logging {
+          level  = "info"
+          format = "logfmt"
+        }
+
+        // ===================================================================
+        // LOGGING — collect all pod logs → Loki
+        // ===================================================================
+
+        // Discover all pods in the cluster via the Kubernetes API.
+        discovery.kubernetes "pods" {
+          role = "pod"
+        }
+
+        // Relabel: copy useful k8s metadata onto each log stream.
+        // These become Loki stream labels (low-cardinality identifiers).
+        discovery.relabel "pod_logs" {
+          targets = discovery.kubernetes.pods.targets
+
+          rule {
+            source_labels = ["__meta_kubernetes_namespace"]
+            target_label  = "namespace"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_name"]
+            target_label  = "pod"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_container_name"]
+            target_label  = "container"
+          }
+          rule {
+            source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_name"]
+            target_label  = "app"
+          }
+          // Filter out empty app labels to avoid high-cardinality noise
+          rule {
+            source_labels = ["app"]
+            regex         = "^$"
+            action        = "drop"
+          }
+        }
+
+        // Read logs directly from the node's /var/log/pods filesystem.
+        loki.source.kubernetes "pod_logs" {
+          targets    = discovery.relabel.pod_logs.output
+          forward_to = [loki.process.pod_logs.receiver]
+        }
+
+        // Process: parse structured fields, stamp cluster label.
+        loki.process "pod_logs" {
+          // Stamp every log line with the cluster name.
+          stage.static_labels {
+            values = {
+              cluster = "sandbox-gke",
+            }
+          }
+
+          // Try JSON first (many apps emit structured JSON logs).
+          stage.json {
+            expressions = {
+              level  = "level",
+              msg    = "msg",
+            }
+          }
+
+          // Fall back to logfmt (e.g. Go apps using the default logger).
+          stage.logfmt {
+            mapping = {
+              level = "level",
+            }
+          }
+
+          // Promote parsed fields to Loki stream labels.
+          stage.labels {
+            values = {
+              level = "",
+            }
+          }
+
+          // Keep only the labels we care about — everything else increases index size.
+          stage.label_keep {
+            values = ["namespace", "pod", "container", "app", "cluster", "level"]
+          }
+
+          forward_to = [loki.write.default.receiver]
+        }
+
+        // Collect Kubernetes events as a structured log stream.
+        // Events (pod evictions, node pressure, etc.) are invaluable for debugging.
+        loki.source.kubernetes_events "cluster_events" {
+          job_name   = "kubernetes-events"
+          log_format = "logfmt"
+          forward_to = [loki.write.default.receiver]
+        }
+
+        // Ship logs to Loki.
+        loki.write "default" {
+          endpoint {
+            url = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+          }
+        }
+
+        // ===================================================================
+        // TRACING — receive OTLP spans → extract span metrics → forward to Tempo
+        // ===================================================================
+
+        // OTLP receiver: the otel-demo's internal collector forwards spans here.
+        // gRPC port 4317, HTTP port 4318 — both exposed as a ClusterIP Service.
+        otelcol.receiver.otlp "default" {
+          grpc {
+            endpoint = "0.0.0.0:4317"
+          }
+          http {
+            endpoint = "0.0.0.0:4318"
+          }
+
+          output {
+            // Spans flow into the span-metrics connector first.
+            traces = [otelcol.connector.spanmetrics.default.input]
+          }
+        }
+
+        // Span-metrics: derive RED metrics (rate, error rate, duration) from spans.
+        // These are synthetic Prometheus metrics computed from trace data — no
+        // instrumentation changes required in the app.
+        otelcol.connector.spanmetrics "default" {
+          // Dimensions to break metrics down by.
+          dimension {
+            name = "service.name"
+          }
+          dimension {
+            name    = "http.request.method"
+            default = "GET"
+          }
+          dimension {
+            name = "http.response.status_code"
+          }
+
+          // Latency histogram buckets — tuned for web service response times.
+          histogram {
+            explicit {
+              buckets = ["2ms", "10ms", "50ms", "100ms", "200ms", "500ms", "1s", "5s"]
+            }
+          }
+
+          output {
+            // Derived metrics → Prometheus remote_write
+            metrics = [otelcol.exporter.prometheus.spanmetrics.input]
+            // Raw spans (with span IDs preserved) → batch processor → Tempo
+            traces  = [otelcol.processor.batch.default.input]
+          }
+        }
+
+        // Export span-derived metrics to Prometheus via remote_write receiver.
+        // Requires Prometheus enableRemoteWriteReceiver = true (set in kube-prometheus-stack values).
+        otelcol.exporter.prometheus "spanmetrics" {
+          forward_to = [prometheus.remote_write.default.receiver]
+        }
+
+        prometheus.remote_write "default" {
+          endpoint {
+            url = "http://prometheus-operated.monitoring.svc.cluster.local:9090/api/v1/write"
+          }
+        }
+
+        // Batch spans before sending to Tempo — reduces network overhead.
+        otelcol.processor.batch "default" {
+          output {
+            traces = [otelcol.exporter.otlp.tempo.input]
+          }
+        }
+
+        // Forward spans to Tempo.
+        otelcol.exporter.otlp "tempo" {
+          client {
+            endpoint = "tempo.monitoring.svc.cluster.local:4317"
+            tls {
+              insecure = true
+            }
+          }
+        }
+
+    # Expose OTLP ports as a ClusterIP Service so the otel-demo can reach Alloy.
+    # The demo's collector forwards to alloy.monitoring.svc.cluster.local:4317
+    extraPorts:
+      - name: otlp-grpc
+        port: 4317
+        targetPort: 4317
+        protocol: TCP
+      - name: otlp-http
+        port: 4318
+        targetPort: 4318
+        protocol: TCP
+
+  # Alloy emits its own Prometheus metrics — expose a ServiceMonitor so
+  # kube-prometheus-stack's Prometheus scrapes them automatically.
+  serviceMonitor:
+    enabled: true

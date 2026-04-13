@@ -1,0 +1,4 @@
+# Helm dependency artifacts — ArgoCD fetches these at sync time.
+# Never commit chart tarballs; they bloat the repo and go stale.
+**/charts/
+**/Chart.lock

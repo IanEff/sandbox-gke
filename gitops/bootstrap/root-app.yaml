@@ -1,0 +1,37 @@
+# Bootstrapped by Terraform (modules/bootstrap/main.tf).
+# This is the single kubernetes_manifest resource Terraform creates in the cluster.
+# From here, ArgoCD takes over and self-assembles the rest.
+#
+# The root app watches gitops/cluster/, which contains three ApplicationSets —
+# one per tier (infra → platform → apps). Each ApplicationSet discovers its apps
+# by scanning for config.json files one level deep in its directory.
+#
+# To add a new app: drop a directory + config.json under the right tier.
+# ArgoCD picks it up automatically on the next reconcile loop.
+#
+# REPO_URL: update this to match var.gitops_repo_url in OpenTofu.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cluster-root
+  namespace: argocd
+  # Cascade-delete: removing this Application also removes everything it manages.
+  # Flip to [] if you want to leave child apps running when you delete the root.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/IanEff/sandbox-gke.git  # <-- set via tofu variable
+    targetRevision: HEAD
+    path: gitops/cluster
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

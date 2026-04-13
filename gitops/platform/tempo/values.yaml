@@ -1,0 +1,43 @@
+# Tempo values — single-binary mode
+# Single-binary runs ingester, querier, query-frontend, compactor in one pod.
+# Full reference: https://grafana.com/docs/tempo/latest/setup/helm-chart/
+tempo:
+  tempo:
+    # OTLP receivers — Alloy forwards spans here after span-metrics extraction.
+    # gRPC: 4317, HTTP: 4318
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: "0.0.0.0:4317"
+          http:
+            endpoint: "0.0.0.0:4318"
+
+    # Trace storage — filesystem backend backed by a PVC.
+    # For production: use GCS backend with a dedicated bucket.
+    storage:
+      trace:
+        backend: local
+        local:
+          path: /var/tempo/traces
+        wal:
+          path: /var/tempo/wal  # write-ahead log survives pod restarts
+
+    # Expose the query API on port 3200 — Grafana datasource points here.
+    server:
+      http_listen_port: 3200
+
+    # Query configuration
+    querier:
+      frontend_worker:
+        frontend_address: localhost:9095
+
+  # Persistent storage for traces and WAL
+  persistence:
+    enabled: true
+    size: 10Gi
+    # storageClass: ""  # blank = default GKE StorageClass (standard-rwo)
+
+  # ServiceMonitor so Prometheus scrapes Tempo's own metrics
+  serviceMonitor:
+    enabled: true
