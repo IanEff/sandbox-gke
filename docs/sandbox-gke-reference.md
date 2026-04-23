@@ -24,12 +24,13 @@
 7. [Module Variables Reference](#module-variables-reference)
 8. [IAM Audit](#iam-audit)
 9. [Cost and Spend Management](#cost-and-spend-management)
-10. [OpenTofu Core Concepts](#opentofu-core-concepts)
-11. [Learning Objectives](#learning-objectives)
-12. [Provider and Registry References](#provider-and-registry-references)
-13. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
-14. [Changelog](#changelog)
-15. [Troubleshooting](./troubleshooting.md)
+10. [Interacting with the Cluster](#interacting-with-the-cluster)
+11. [OpenTofu Core Concepts](#opentofu-core-concepts)
+12. [Learning Objectives](#learning-objectives)
+13. [Provider and Registry References](#provider-and-registry-references)
+14. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
+15. [Changelog](#changelog)
+16. [Troubleshooting](./troubleshooting.md)
 
 ---
 
@@ -1051,6 +1052,182 @@ Minimum roles required for OpenTofu to run this configuration:
 - The GCS state bucket costs essentially nothing and should be kept between sessions.
 
 With $310 in credits and disciplined teardown, this project effectively never runs out.
+
+---
+
+## Interacting with the Cluster
+
+Everything here runs from the command line. After `tofu apply` completes, the cluster is up
+and ArgoCD is syncing. Here's how to get in and poke around.
+
+---
+
+### Get Credentials
+
+OpenTofu printed the exact command as part of its output:
+
+```bash
+tofu output get_credentials_command
+```
+
+Or run it directly:
+
+```bash
+gcloud container clusters get-credentials sandbox-gke \
+  --zone us-east1-b \
+  --project terraform-sandbox-430820
+```
+
+This writes a new context into `~/.kube/config` and makes it the current context. Confirm
+it worked:
+
+```bash
+kubectl config current-context
+kubectl get nodes
+```
+
+You should see your `e2-standard-2` spot nodes in `Ready` state.
+
+---
+
+### Basic Cluster Inspection
+
+```bash
+# Nodes and their status
+kubectl get nodes -o wide
+
+# Everything running across all namespaces — good first-look command
+kubectl get pods -A
+
+# What's in the ArgoCD namespace
+kubectl get all -n argocd
+
+# Infra/platform namespaces — populated after ArgoCD sync-waves complete
+kubectl get pods -n cert-manager
+kubectl get pods -n monitoring
+kubectl get pods -n logging
+kubectl get pods -n tracing
+```
+
+---
+
+### ArgoCD
+
+#### Get the Initial Admin Password
+
+```bash
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d && echo
+```
+
+The `&& echo` adds a newline so your prompt doesn't run into the password.
+
+#### Port-Forward the UI
+
+```bash
+kubectl port-forward svc/argocd-server 8080:80 -n argocd
+```
+
+Then open http://localhost:8080. Username: `admin`, password from the secret above.
+
+> The chart is deployed with `--insecure` and `service.type=ClusterIP` — port-forward is
+> the intended access method. No ingress, no LoadBalancer, no TLS headaches.
+
+#### ArgoCD CLI
+
+Install once:
+
+```bash
+brew install argocd
+```
+
+Log in (requires the port-forward above to be running):
+
+```bash
+argocd login localhost:8080 --username admin --insecure
+```
+
+Useful commands:
+
+```bash
+# List all Applications and their sync/health status
+argocd app list
+
+# Detailed view of a specific Application (shows sync errors, resource tree)
+argocd app get cluster-root
+
+# Manually trigger a sync — useful when testing gitops changes
+argocd app sync cluster-root
+
+# Watch sync status live
+argocd app get cluster-root --watch
+```
+
+---
+
+### Watching the Sync-Wave Progression After Apply
+
+ArgoCD begins syncing `gitops/cluster/` automatically once the root Application is
+created. The three ApplicationSets fire in sync-wave order. Watch it happen:
+
+```bash
+# Watch Applications appear and reach Synced/Healthy
+kubectl get applications -n argocd -w
+
+# Or with the argocd CLI (more readable output)
+watch argocd app list
+```
+
+Expected progression:
+
+1. `cluster-root` syncs → creates three ApplicationSets
+2. ApplicationSets create per-wave Applications
+3. Wave 0: `cert-manager` (infra-set)
+4. Wave 1: `kube-prometheus-stack`, `loki`, `tempo`, `alloy` (platform-set)
+5. Wave 2: `otel-demo` (apps-set)
+
+Waves 1 and 2 each take a few minutes. Full convergence from a fresh `tofu apply` to
+everything `Healthy` is typically 10–15 minutes after the apply completes.
+
+---
+
+### Logs and Debugging
+
+```bash
+# Tail logs from a deployment
+kubectl logs -n argocd deploy/argocd-server -f
+
+# Describe a resource to see events — useful when a pod is stuck Pending or CrashLooping
+kubectl describe pod -n argocd <pod-name>
+
+# Get events for a namespace sorted by time
+kubectl get events -n argocd --sort-by='.lastTimestamp'
+
+# Show what ArgoCD thinks the sync error is
+argocd app get <app-name>
+
+# Exec into a running container for interactive debugging
+kubectl exec -it -n argocd deploy/argocd-server -- /bin/sh
+```
+
+---
+
+### Managing Contexts
+
+If you tear down and recreate the cluster, `gcloud container clusters get-credentials`
+creates a new context. List and switch contexts:
+
+```bash
+# List all contexts
+kubectl config get-contexts
+
+# Switch to a specific context
+kubectl config use-context <context-name>
+
+# Delete a stale context after tofu destroy
+# Context name format: gke_<project>_<zone>_<cluster-name>
+kubectl config delete-context gke_terraform-sandbox-430820_us-east1-b_sandbox-gke
+```
 
 ---
 
