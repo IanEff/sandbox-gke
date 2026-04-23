@@ -66,11 +66,24 @@ resource "google_container_node_pool" "primary" {
     machine_type = "e2-standard-2"
     spot         = true # preemptible VMs — ~70% cost reduction; GKE restarts pods if a node is reclaimed
 
-    service_account = var.node_sa_email
+    service_account = google_service_account.gke_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"] # Best practice: broad scope here, limit via IAM on the SA
 
     workload_metadata_config {
       mode = "GKE_METADATA" # required for Workload Identity — prevents pods from reaching the node metadata server directly
     }
   }
+}
+
+# Workload identity block
+resource "google_service_account" "workload" {
+  account_id   = "sandbox-gke-workload"
+  display_name = "Example workload SA"
+  project      = var.project_id
+}
+
+resource "google_service_account_iam_member" "workload_identity_binding" {
+  service_account_id = google_service_account.workload.name
+  role               = "roles/iam.workloadIdentityUser"
+  member             = "serviceAccount:${var.project_id}.svc.id.goog[${var.k8s_namespace}/${var.k8s_sa_name}]"
 }
