@@ -13,10 +13,10 @@
 4. [Reference: Layer by Layer](#reference-layer-by-layer)
    - [Layer 0: Manual Bootstrap](#layer-0-manual-bootstrap-the-irreducible-exception)
    - [Layer 1: GCP Project Configuration](#layer-1-gcp-project-configuration)
-   - [Layer 2: Networking](#layer-2-networking-modulesvpc)
-   - [Layer 3: GKE Cluster + Node Pool](#layer-3-gke-cluster--node-pool-modulesgke)
-   - [Layer 4: Workload Identity](#layer-4-workload-identity-modulesgke)
-   - [Layer 5: ArgoCD Bootstrap](#layer-5-argocd-bootstrap-modulesbootstrap)
+   - [Layer 2: Networking](#layer-2-networking)
+   - [Layer 3: GKE Cluster + Node Pool](#layer-3-gke-cluster-and-node-pool)
+   - [Layer 4: Workload Identity](#layer-4-workload-identity)
+   - [Layer 5: ArgoCD Bootstrap](#layer-5-argocd-bootstrap)
 5. [Backend Configuration](#backend-configuration)
 6. [Variables and Outputs](#variables-and-outputs)
 7. [IAM Audit](#iam-audit)
@@ -94,7 +94,7 @@ sandbox-gke/
 > **Why is `providers.tf` root-only?** The `kubernetes` and `helm` providers need the GKE
 > cluster's endpoint and CA certificate — values that don't exist until after the cluster is
 > provisioned. OpenTofu requires all provider blocks to live in the root module so it can
-> manage this dependency. See [Layer 5](#layer-5-argocd-bootstrap-modulesbootstrap) for the
+> manage this dependency. See [Layer 5](#layer-5-argocd-bootstrap) for the
 > full explanation.
 
 ---
@@ -179,7 +179,7 @@ gitops_repo_url = "https://github.com/<your-username>/sandbox-gke"
 ### Step 4 — VPC Module
 
 - [ ] Write `modules/vpc/variables.tf`
-- [ ] Write `modules/vpc/main.tf` → see [Layer 2](#layer-2-networking-modulesvpc)
+- [ ] Write `modules/vpc/main.tf` → see [Layer 2](#layer-2-networking)
 - [ ] Write `modules/vpc/outputs.tf` — must export `network_id` and `subnetwork_id`
 
 ---
@@ -193,8 +193,8 @@ resources.
 - [ ] Write `modules/gke/variables.tf`
 - [ ] Write `modules/gke/main.tf`:
   - Node SA + IAM bindings → [Layer 1b](#1b-service-account-for-the-gke-node-pool)
-  - Cluster + node pool → [Layer 3](#layer-3-gke-cluster--node-pool-modulesgke)
-  - Workload Identity → [Layer 4](#layer-4-workload-identity-modulesgke)
+  - Cluster + node pool → [Layer 3](#layer-3-gke-cluster-and-node-pool)
+  - Workload Identity → [Layer 4](#layer-4-workload-identity)
 - [ ] Write `modules/gke/outputs.tf` — must export `endpoint`, `ca_certificate`, and
   `node_sa_email`; mark the first two `sensitive = true`
 
@@ -203,7 +203,7 @@ resources.
 ### Step 6 — Bootstrap Module
 
 - [ ] Write `modules/bootstrap/variables.tf` — needs `gitops_repo_url` as an input
-- [ ] Write `modules/bootstrap/main.tf` → see [Layer 5](#layer-5-argocd-bootstrap-modulesbootstrap)
+- [ ] Write `modules/bootstrap/main.tf` → see [Layer 5](#layer-5-argocd-bootstrap)
 - [ ] Write `modules/bootstrap/outputs.tf`
 
 ---
@@ -423,7 +423,7 @@ resource "google_project_iam_member" "gke_nodes_registry_reader" {
 
 ---
 
-### Layer 2: Networking (`modules/vpc/`)
+### Layer 2: Networking
 
 Never use the GCP default VPC — it uses auto-mode subnets that do not give you control over
 IP ranges. OpenTofu manages a dedicated VPC and subnet with explicit CIDR ranges.
@@ -472,7 +472,7 @@ output "subnetwork_id" {
 
 ---
 
-### Layer 3: GKE Cluster + Node Pool (`modules/gke/`)
+### Layer 3: GKE Cluster and Node Pool
 
 [Google provider registry](https://search.opentofu.org/provider/opentofu/google/)
 
@@ -503,7 +503,7 @@ resource "google_container_cluster" "primary" {
   }
 
   lifecycle {
-    prevent_destroy = false  # flip to true once you are happy with the cluster configuration
+    prevent_destroy = false
   }
 }
 ```
@@ -530,23 +530,16 @@ resource "google_container_node_pool" "primary" {
     spot         = true  # preemptible VMs — ~70% cost reduction; GKE restarts pods if a node is reclaimed
 
     service_account = var.node_sa_email
-    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+    oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"] # Best practice: broad scope here, limit via IAM on the SA
 
     workload_metadata_config {
       mode = "GKE_METADATA"  # required for Workload Identity — prevents pods from reaching the node metadata server directly
     }
   }
-
-  depends_on = [google_container_cluster.primary]
 }
 ```
 
 [`depends_on` docs](https://opentofu.org/docs/language/meta-arguments/depends_on/)
-
-`depends_on` is a last resort for dependencies OpenTofu cannot infer from resource references.
-The docs note it causes more conservative plans. It is justified here: the node pool does
-not reference enough cluster attributes for OpenTofu to reliably infer the ordering across
-all plan scenarios.
 
 #### GKE Module Outputs
 
@@ -569,7 +562,7 @@ output "node_sa_email" {
 
 ---
 
-### Layer 4: Workload Identity (`modules/gke/`)
+### Layer 4: Workload Identity
 
 [Authenticate to Google Cloud APIs from GKE workloads](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/workload-identity)
 
@@ -611,7 +604,7 @@ metadata:
 
 ---
 
-### Layer 5: ArgoCD Bootstrap (`modules/bootstrap/`)
+### Layer 5: ArgoCD Bootstrap
 
 #### The Provider Chaining Problem
 
@@ -619,7 +612,7 @@ The `kubernetes` and `helm` providers need the GKE cluster's endpoint and CA cer
 Those values do not exist until the cluster is provisioned. This creates a sequencing
 problem that OpenTofu solves through **provider chaining**.
 
-[Provider configuration docs](https://opentofu.org/docs/language/modules/develop/providers/)
+[Provider configuration docs](https://opentofu.org/docs/language/modules/develop/providers/) | [Cluster Access & Auth Plugins](https://cloud.google.com/kubernetes-engine/docs/how-to/cluster-access-for-kubectl)
 
 Key rule from the docs: **provider configurations can be defined only in the root module.**
 Child modules cannot contain `provider` blocks — if they did, the module would be
