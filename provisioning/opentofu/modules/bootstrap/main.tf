@@ -31,16 +31,16 @@ resource "kubernetes_manifest" "argocd_app" {
     apiVersion = "argoproj.io/v1alpha1"
     kind       = "Application"
     metadata = {
-      name      = "cluster-root"
-      namespace = "argocd"
-      finalizers = ["resources-finalizer.argocd.argoproj.io"]   # cascade-delete: removing this Application also removes everything it manages
+      name       = "cluster-root"
+      namespace  = "argocd"
+      finalizers = ["resources-finalizer.argocd.argoproj.io"] # cascade-delete: removing this Application also removes everything it manages
     }
     spec = {
       project = "default"
       source = {
         repoURL        = var.gitops_repo_url
         targetRevision = "HEAD"
-        path           = "gitops/cluster"   # the kustomization + three ApplicationSets
+        path           = "gitops/cluster" # the kustomization + three ApplicationSets
       }
       destination = {
         server    = "https://kubernetes.default.svc"
@@ -59,5 +59,5 @@ resource "kubernetes_manifest" "argocd_app" {
     }
   }
 
-  depends_on = [helm_release.argocd]   # ArgoCD CRDs must exist before an Application CRD can be created
+  depends_on = [helm_release.argocd] # ArgoCD CRDs must exist before an Application CRD can be created
 }

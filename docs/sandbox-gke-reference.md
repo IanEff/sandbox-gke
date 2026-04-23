@@ -1,5 +1,7 @@
 # `sandbox-gke` — OpenTofu Reference Guide
 
+**v1.1** — April 2026
+
 > An educational reference guide to building a push-button GKE cluster with OpenTofu,
 > structured around the official OpenTofu documentation.
 
@@ -19,12 +21,14 @@
    - [Layer 5: ArgoCD Bootstrap](#layer-5-argocd-bootstrap)
 5. [Backend Configuration](#backend-configuration)
 6. [Variables and Outputs](#variables-and-outputs)
-7. [IAM Audit](#iam-audit)
-8. [Cost and Spend Management](#cost-and-spend-management)
-9. [OpenTofu Core Concepts](#opentofu-core-concepts)
-10. [Learning Objectives](#learning-objectives)
-11. [Provider and Registry References](#provider-and-registry-references)
-12. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
+7. [Module Variables Reference](#module-variables-reference)
+8. [IAM Audit](#iam-audit)
+9. [Cost and Spend Management](#cost-and-spend-management)
+10. [OpenTofu Core Concepts](#opentofu-core-concepts)
+11. [Learning Objectives](#learning-objectives)
+12. [Provider and Registry References](#provider-and-registry-references)
+13. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
+14. [Changelog](#changelog)
 
 ---
 
@@ -178,7 +182,7 @@ gitops_repo_url = "https://github.com/<your-username>/sandbox-gke"
 
 ### Step 4 — VPC Module
 
-- [ ] Write `modules/vpc/variables.tf`
+- [ ] Write `modules/vpc/variables.tf` → see [Layer 2](#layer-2-networking) for the complete file
 - [ ] Write `modules/vpc/main.tf` → see [Layer 2](#layer-2-networking)
 - [ ] Write `modules/vpc/outputs.tf` — must export `network_id` and `subnetwork_id`
 
@@ -190,7 +194,7 @@ This module contains three conceptual layers (service account, cluster + node po
 identity) but they all live in one `main.tf` because they're all tightly coupled GKE
 resources.
 
-- [ ] Write `modules/gke/variables.tf`
+- [ ] Write `modules/gke/variables.tf` → see [Layer 3](#layer-3-gke-cluster-and-node-pool) for the complete file
 - [ ] Write `modules/gke/main.tf`:
   - Node SA + IAM bindings → [Layer 1b](#1b-service-account-for-the-gke-node-pool)
   - Cluster + node pool → [Layer 3](#layer-3-gke-cluster-and-node-pool)
@@ -202,7 +206,7 @@ resources.
 
 ### Step 6 — Bootstrap Module
 
-- [ ] Write `modules/bootstrap/variables.tf` — needs `gitops_repo_url` as an input
+- [ ] Write `modules/bootstrap/variables.tf` → see [Layer 5](#layer-5-argocd-bootstrap) for the complete file
 - [ ] Write `modules/bootstrap/main.tf` → see [Layer 5](#layer-5-argocd-bootstrap)
 - [ ] Write `modules/bootstrap/outputs.tf`
 
@@ -470,6 +474,19 @@ output "subnetwork_id" {
 }
 ```
 
+**`provisioning/opentofu/modules/vpc/variables.tf`**
+```hcl
+variable "project_id" {
+  type        = string
+  description = "GCP project ID"
+}
+
+variable "region" {
+  type        = string
+  description = "GCP region"
+}
+```
+
 ---
 
 ### Layer 3: GKE Cluster and Node Pool
@@ -529,7 +546,7 @@ resource "google_container_node_pool" "primary" {
     machine_type = "e2-standard-2"
     spot         = true  # preemptible VMs — ~70% cost reduction; GKE restarts pods if a node is reclaimed
 
-    service_account = var.node_sa_email
+    service_account = google_service_account.gke_nodes.email   # direct reference — both resources live in this module
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"] # Best practice: broad scope here, limit via IAM on the SA
 
     workload_metadata_config {
@@ -538,6 +555,11 @@ resource "google_container_node_pool" "primary" {
   }
 }
 ```
+
+> **Note on self-reference:** `service_account` references `google_service_account.gke_nodes.email`
+> directly rather than via an input variable. Both resources live in this module, so a direct
+> reference is correct and simpler. A `var.node_sa_email` input would be circular — the root would
+> have to read the SA email output and immediately pass it back as an input to the same module.
 
 [`depends_on` docs](https://opentofu.org/docs/language/meta-arguments/depends_on/)
 
@@ -557,6 +579,41 @@ output "ca_certificate" {
 
 output "node_sa_email" {
   value = google_service_account.gke_nodes.email
+}
+```
+
+**`provisioning/opentofu/modules/gke/variables.tf`**
+```hcl
+variable "project_id" {
+  type        = string
+  description = "GCP project ID"
+}
+
+variable "zone" {
+  type        = string
+  description = "GCP zone for the GKE cluster"
+}
+
+variable "network_id" {
+  type        = string
+  description = "VPC network ID"
+}
+
+variable "subnetwork_id" {
+  type        = string
+  description = "Subnetwork ID"
+}
+
+variable "k8s_namespace" {
+  type        = string
+  description = "Kubernetes namespace for the workload identity binding"
+  default     = "default"
+}
+
+variable "k8s_sa_name" {
+  type        = string
+  description = "Kubernetes service account name for the workload identity binding"
+  default     = "default"
 }
 ```
 
@@ -655,8 +712,15 @@ access token from your ADC credentials.
 
 #### ArgoCD via Helm
 
-Pin the chart version to something specific before applying — `7.x.x` is a placeholder.
-Look up the current release at [artifacthub.io](https://artifacthub.io/packages/helm/argo-cd-charts/argo-cd).
+[artifacthub.io — argo-cd chart](https://artifacthub.io/packages/helm/argo-cd-charts/argo-cd)
+
+Pinned to `9.5.4` (Argo CD v3.x, stable as of April 2026). Check artifacthub.io for the
+latest release before a fresh apply — this version string is the first thing to go stale.
+
+The three `set` blocks configure common sandbox concerns:
+- **`server.service.type = ClusterIP`** — no external LoadBalancer; access the UI via `kubectl port-forward`
+- **`controller.enableApplicationSet = true`** — explicit opt-in; v3+ enables this by default but being explicit prevents drift
+- **`server.extraArgs = {--insecure}`** — disables TLS on the server; avoids certificate warnings when port-forwarding
 
 **`provisioning/opentofu/modules/bootstrap/main.tf`**
 ```hcl
@@ -664,13 +728,26 @@ resource "helm_release" "argocd" {
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
   chart            = "argo-cd"
-  version          = "7.x.x"   # pin to a specific version before applying
+  version          = "9.5.4"   # Argo CD v3.x — check artifacthub.io before applying
   namespace        = "argocd"
   create_namespace = true
 
+  # No external LoadBalancer — use kubectl port-forward in a sandbox
   set {
     name  = "server.service.type"
-    value = "ClusterIP"  # no external LoadBalancer — use kubectl port-forward in a sandbox
+    value = "ClusterIP"
+  }
+
+  # Argo CD v3+ enables ApplicationSets by default, but explicit is better than implicit
+  set {
+    name  = "controller.enableApplicationSet"
+    value = "true"
+  }
+
+  # Disable TLS to avoid certificate warnings when port-forwarding
+  set {
+    name  = "server.extraArgs"
+    value = "{--insecure}"
   }
 }
 ```
@@ -720,6 +797,14 @@ resource "kubernetes_manifest" "argocd_app" {
   }
 
   depends_on = [helm_release.argocd]   # ArgoCD CRDs must exist before an Application CRD can be created
+}
+```
+
+**`provisioning/opentofu/modules/bootstrap/variables.tf`**
+```hcl
+variable "gitops_repo_url" {
+  type        = string
+  description = "URL of the GitOps repo — ArgoCD points at gitops/cluster/ after bootstrap"
 }
 ```
 
@@ -782,11 +867,32 @@ within that module.
 ## Backend Configuration
 
 [Backend configuration docs](https://opentofu.org/docs/language/settings/backends/configuration/)  
-[GCS backend docs](https://opentofu.org/docs/language/settings/backends/gcs/)
+[GCS backend docs](https://opentofu.org/docs/language/settings/backends/gcs/)  
+[`required_providers` docs](https://opentofu.org/docs/language/providers/requirements/)
+
+`backend.tf` does double duty: it configures the GCS remote state backend **and** pins provider
+versions via `required_providers`. Pinning prevents surprise breakage when a provider ships a
+new major version. The `~>` constraint allows patch and minor upgrades but not major ones —
+`~> 6.0` means `>= 6.0, < 7.0`.
 
 **`provisioning/opentofu/backend.tf`**
 ```hcl
 terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 6.0"
+    }
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.0"
+    }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.0"
+    }
+  }
+
   backend "gcs" {
     bucket = "sandbox-gke-tofu-state"
     prefix = "sandbox-gke/opentofu"
@@ -868,6 +974,30 @@ output "get_credentials_command" {
   value = "gcloud container clusters get-credentials sandbox-gke --zone ${var.zone} --project ${var.project_id}"
 }
 ```
+
+---
+
+## Module Variables Reference
+
+Each child module declares its own input variables. They're documented inline in their
+respective Layer sections — this table is a quick cross-reference for when you need to
+know which module accepts which inputs at a glance.
+
+| Module | Variable | Type | Default | Where it flows |
+|---|---|---|---|---|
+| `vpc` | `project_id` | `string` | — | `google_compute_network`, `google_compute_subnetwork` |
+| `vpc` | `region` | `string` | — | `google_compute_subnetwork.region` |
+| `gke` | `project_id` | `string` | — | cluster, node pool, service accounts |
+| `gke` | `zone` | `string` | — | cluster and node pool `location` |
+| `gke` | `network_id` | `string` | — | `google_container_cluster.network` |
+| `gke` | `subnetwork_id` | `string` | — | `google_container_cluster.subnetwork` |
+| `gke` | `k8s_namespace` | `string` | `"default"` | workload identity IAM binding member string |
+| `gke` | `k8s_sa_name` | `string` | `"default"` | workload identity IAM binding member string |
+| `bootstrap` | `gitops_repo_url` | `string` | — | ArgoCD root Application `repoURL` |
+
+All values flow from the root module's `main.tf` module blocks. `k8s_namespace` and
+`k8s_sa_name` default to `"default"` as placeholders — update them when you add a real
+workload that needs Workload Identity access to GCP APIs.
 
 ---
 
@@ -1010,3 +1140,28 @@ graph vs declarative HCL).
 
 Deferred until the OpenTofu version is working. Stack would live in `provisioning/pulumi/`
 alongside the OpenTofu configuration, pointing at the same GCS bucket with a different prefix.
+
+---
+
+## Changelog
+
+### v1.1 — April 2026
+
+Corrections and additions found during initial `tofu validate` and first apply attempt.
+
+- **`backend.tf`** — Added `required_providers` block pinning `google ~> 6.0`,
+  `kubernetes ~> 2.0`, `helm ~> 2.0`. The original guide noted this was needed but
+  omitted the actual block from the code sample.
+- **`modules/gke/main.tf`** — Fixed node pool `service_account`: was incorrectly using
+  `var.node_sa_email`, a variable that was never declared and would have been circular.
+  Corrected to `google_service_account.gke_nodes.email` — a direct reference within
+  the same module.
+- **`modules/bootstrap/main.tf`** — Replaced placeholder `version = "7.x.x"` with
+  `9.5.4` (Argo CD v3.x, stable April 2026). Added `controller.enableApplicationSet`
+  and `server.extraArgs = {--insecure}` set blocks.
+- **All three module `variables.tf` files** — Were scaffolded as empty stubs in the
+  original guide. Now contain the variable declarations required by each module's `main.tf`.
+
+### v1.0 — initial
+
+Original guide generated for project setup.
