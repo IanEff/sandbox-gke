@@ -29,6 +29,7 @@
 12. [Provider and Registry References](#provider-and-registry-references)
 13. [Appendix: Pulumi/Python Alternative](#appendix-pulumipython-alternative)
 14. [Changelog](#changelog)
+15. [Troubleshooting](./troubleshooting.md)
 
 ---
 
@@ -1144,6 +1145,21 @@ alongside the OpenTofu configuration, pointing at the same GCS bucket with a dif
 ---
 
 ## Changelog
+
+### v1.2 — April 2026
+
+Fix applied during first `tofu plan` run. See [troubleshooting.md](./troubleshooting.md) for full details.
+
+- **`backend.tf`** — Added `gavinbunney/kubectl ~> 1.14` to `required_providers`.
+- **`providers.tf`** — Added `kubectl` provider block (same cluster credentials as `helm`;
+  `load_config_file = false` to prevent fallback to local kubeconfig).
+- **`modules/bootstrap/main.tf`** — Replaced `kubernetes_manifest` (hashicorp/kubernetes)
+  with `kubectl_manifest` (gavinbunney/kubectl). `kubernetes_manifest` contacts the live
+  API server during `tofu plan` to fetch CRD schemas, which fails when the cluster doesn't
+  exist yet. `kubectl_manifest` treats the manifest as a YAML string and only connects at
+  apply time. Also added a `terraform { required_providers }` block to the module so
+  OpenTofu resolves `kubectl` to `gavinbunney/kubectl` instead of the nonexistent
+  `hashicorp/kubectl`.
 
 ### v1.1 — April 2026
 

@@ -1,3 +1,14 @@
+terraform {
+  required_providers {
+    helm = {
+      source = "hashicorp/helm"
+    }
+    kubectl = {
+      source = "gavinbunney/kubectl"
+    }
+  }
+}
+
 resource "helm_release" "argocd" {
   name             = "argocd"
   repository       = "https://argoproj.github.io/argo-helm"
@@ -25,39 +36,33 @@ resource "helm_release" "argocd" {
   }
 }
 
-# Create the cluster
-resource "kubernetes_manifest" "argocd_app" {
-  manifest = {
-    apiVersion = "argoproj.io/v1alpha1"
-    kind       = "Application"
-    metadata = {
-      name       = "cluster-root"
-      namespace  = "argocd"
-      finalizers = ["resources-finalizer.argocd.argoproj.io"] # cascade-delete: removing this Application also removes everything it manages
-    }
-    spec = {
-      project = "default"
-      source = {
-        repoURL        = var.gitops_repo_url
-        targetRevision = "HEAD"
-        path           = "gitops/cluster" # the kustomization + three ApplicationSets
-      }
-      destination = {
-        server    = "https://kubernetes.default.svc"
-        namespace = "argocd"
-      }
-      syncPolicy = {
-        automated = {
-          prune    = true
-          selfHeal = true
-        }
-        syncOptions = [
-          "CreateNamespace=true",
-          "ServerSideApply=true",
-        ]
-      }
-    }
-  }
+# Create the cluster root Application — uses gavinbunney/kubectl so no live cluster is needed at plan time
+resource "kubectl_manifest" "argocd_app" {
+  yaml_body = <<-YAML
+    apiVersion: argoproj.io/v1alpha1
+    kind: Application
+    metadata:
+      name: cluster-root
+      namespace: argocd
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+    spec:
+      project: default
+      source:
+        repoURL: ${var.gitops_repo_url}
+        targetRevision: HEAD
+        path: gitops/cluster
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: argocd
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+  YAML
 
   depends_on = [helm_release.argocd] # ArgoCD CRDs must exist before an Application CRD can be created
 }
